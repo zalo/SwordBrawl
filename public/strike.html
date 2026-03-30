@@ -1,0 +1,2161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MimicKit - HRL Strike Task</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; }
+#overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(26,26,46,0.95); z-index: 10;
+    flex-direction: column; color: #e0e0ff;
+}
+#overlay h1 { font-size: 2em; margin-bottom: 0.5em; }
+#overlay .status { font-size: 1.1em; opacity: 0.8; margin-top: 0.5em; }
+#overlay .spinner {
+    width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.15);
+    border-top-color: #7c83ff; border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin: 1em;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#hud {
+    position: absolute; top: 12px; left: 16px; color: #b0b0d0;
+    font-size: 13px; line-height: 1.6; pointer-events: none; z-index: 5;
+}
+#hud .title { font-size: 15px; font-weight: 600; color: #d0d0ff; }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+    <h1>MimicKit Web Demo</h1>
+    <div class="spinner"></div>
+    <div class="status" id="loadStatus">Initializing...</div>
+</div>
+
+<div id="hud">
+    <div class="title">HRL Strike Task - Sword &amp; Shield</div>
+    <div id="fpsDisplay">FPS: --</div>
+    <div id="physInfo">PhysX WASM + ONNX Runtime</div>
+</div>
+
+<!-- ONNX Runtime (loaded globally) -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
+<!-- MJCF parser (converts MuJoCo XML to humanoidData at runtime) -->
+<script>
+/**
+ * Parse a MuJoCo MJCF XML string into the humanoidData structure used by the web demo.
+ * Produces: bodies, joints, fixedJoints, dofInfo, kinematicJoints,
+ *           fk_parent_indices, fk_local_translations, fk_local_rotations, actuatorOrder.
+ *
+ * Model-specific data (obs_mean/std, init_dof_pos, action bounds, etc.)
+ * must be provided separately via a config object.
+ */
+
+// -- Vector / quaternion math ------------------------------------------------
+
+function _normalize(v) {
+    const n = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
+    return n < 1e-12 ? v : v.map(x => x / n);
+}
+
+function _cross(a, b) {
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+
+function _dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+
+function _getRotationQuat(from, to) {
+    const u = _normalize(from), v = _normalize(to);
+    const d = _dot(u, v);
+    if (d > 1 - 1e-6) return [0, 0, 0, 1]; // identity xyzw
+    if (d < 1e-6 - 1) {
+        let axis = _cross([1,0,0], u);
+        if (_dot(axis, axis) < 1e-6) axis = _cross([0,1,0], u);
+        axis = _normalize(axis);
+        return [axis[0], axis[1], axis[2], 0]; // 180 deg
+    }
+    const c = _cross(u, v);
+    const s = Math.sqrt((1 + d) * 2), inv = 1 / s;
+    const q = [c[0]*inv, c[1]*inv, c[2]*inv, 0.5*s];
+    const qn = Math.sqrt(q.reduce((s, x) => s + x * x, 0));
+    return q.map(x => x / qn);
+}
+
+function _quatRotate(q, v) {
+    const qv = [q[0],q[1],q[2]], qw = q[3];
+    const t = [2*(qv[1]*v[2]-qv[2]*v[1]), 2*(qv[2]*v[0]-qv[0]*v[2]), 2*(qv[0]*v[1]-qv[1]*v[0])];
+    return [v[0]+qw*t[0]+qv[1]*t[2]-qv[2]*t[1],
+            v[1]+qw*t[1]+qv[2]*t[0]-qv[0]*t[2],
+            v[2]+qw*t[2]+qv[0]*t[1]-qv[1]*t[0]];
+}
+
+function _mat33ToQuat(cols) {
+    const [m00,m10,m20] = cols[0], [m01,m11,m21] = cols[1], [m02,m12,m22] = cols[2];
+    const tr = m00 + m11 + m22;
+    let x, y, z, w;
+    if (tr >= 0) {
+        const h = Math.sqrt(tr + 1); w = 0.5*h; const f = 0.5/h;
+        x = (m21-m12)*f; y = (m02-m20)*f; z = (m10-m01)*f;
+    } else {
+        let i = 0;
+        if (m11 > m00) i = 1;
+        if (m22 > [m00,m11,m22][i]) i = 2;
+        if (i === 0) {
+            const h = Math.sqrt(m00-m11-m22+1); x = 0.5*h; const f = 0.5/h;
+            y = (m01+m10)*f; z = (m20+m02)*f; w = (m21-m12)*f;
+        } else if (i === 1) {
+            const h = Math.sqrt(m11-m22-m00+1); y = 0.5*h; const f = 0.5/h;
+            z = (m12+m21)*f; x = (m01+m10)*f; w = (m02-m20)*f;
+        } else {
+            const h = Math.sqrt(m22-m00-m11+1); z = 0.5*h; const f = 0.5/h;
+            x = (m20+m02)*f; y = (m12+m21)*f; w = (m10-m01)*f;
+        }
+    }
+    const q = [x,y,z,w], n = Math.sqrt(q.reduce((s,v)=>s+v*v,0));
+    return q.map(v => v/n);
+}
+
+function _computeJointFrame(jointAxes) {
+    const axisMap = [0, 1, 2];
+    const n = jointAxes.length;
+    if (n === 0) return { q: [0,0,0,1], axisMap };
+    if (n === 1) return { q: _getRotationQuat([1,0,0], jointAxes[0]), axisMap };
+
+    const Q = _getRotationQuat(jointAxes[0], [1,0,0]);
+    const b = _normalize(_quatRotate(Q, jointAxes[1]));
+
+    if (n === 2) {
+        if (Math.abs(_dot(b,[0,1,0])) > Math.abs(_dot(b,[0,0,1]))) {
+            axisMap[1] = 1;
+            const c = _normalize(_cross(jointAxes[0], jointAxes[1]));
+            return { q: _mat33ToQuat([_normalize(jointAxes[0]), _normalize(jointAxes[1]), c]), axisMap };
+        } else {
+            axisMap[1] = 2; axisMap[2] = 1;
+            const c = _normalize(_cross(jointAxes[1], jointAxes[0]));
+            return { q: _mat33ToQuat([_normalize(jointAxes[0]), c, _normalize(jointAxes[1])]), axisMap };
+        }
+    }
+    // n === 3
+    if (Math.abs(_dot(b,[0,1,0])) > Math.abs(_dot(b,[0,0,1]))) {
+        axisMap[1] = 1; axisMap[2] = 2;
+        return { q: _mat33ToQuat([_normalize(jointAxes[0]), _normalize(jointAxes[1]), _normalize(jointAxes[2])]), axisMap };
+    } else {
+        axisMap[1] = 2; axisMap[2] = 1;
+        return { q: _mat33ToQuat([_normalize(jointAxes[0]), _normalize(jointAxes[2]), _normalize(jointAxes[1])]), axisMap };
+    }
+}
+
+// -- MJCF Parser -------------------------------------------------------------
+
+function _parseVec(s, n) {
+    if (!s) return null;
+    const parts = s.trim().split(/\s+/).map(Number);
+    return n ? parts.slice(0, n) : parts;
+}
+
+function parseMJCF(xmlText, opts = {}) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'text/xml');
+    const root = doc.documentElement;
+
+    let fixedBodies = opts.fixedBodies;
+    if (!fixedBodies) {
+        fixedBodies = new Set();
+        const scan = (el, isRoot) => {
+            if (!isRoot) {
+                const hinges = [...el.querySelectorAll(':scope > joint')].filter(
+                    j => (j.getAttribute('type') || 'hinge') !== 'free');
+                const freeJ = el.querySelector(':scope > freejoint');
+                if (!hinges.length && !freeJ) fixedBodies.add(el.getAttribute('name'));
+            }
+            for (const child of el.querySelectorAll(':scope > body')) scan(child, false);
+        };
+        for (const b of root.querySelector('worldbody').querySelectorAll(':scope > body'))
+            scan(b, true);
+    }
+
+    const actuatorMap = {};
+    const actuatorOrder = [];
+    const actuatorSec = root.querySelector('actuator');
+    if (actuatorSec) {
+        for (const mot of actuatorSec.querySelectorAll('motor')) {
+            const jname = mot.getAttribute('joint');
+            if (!jname) continue;
+            const gear = parseFloat(mot.getAttribute('gear') || '1');
+            const frc = _parseVec(mot.getAttribute('actuatorfrcrange'), 2);
+            const maxForce = frc ? Math.max(Math.abs(frc[0]), Math.abs(frc[1])) : gear;
+            actuatorMap[jname] = { gear, maxForce };
+            actuatorOrder.push(jname);
+        }
+    }
+
+    const bodies = [], joints = [], fixedJoints = [];
+
+    function processBody(el, parentName, parentWorldPos) {
+        const name = el.getAttribute('name');
+        const localPos = _parseVec(el.getAttribute('pos'), 3) || [0,0,0];
+        const worldPos = localPos.map((v, i) => parentWorldPos[i] + v);
+
+        const geoms = [];
+        for (const ge of el.querySelectorAll(':scope > geom')) {
+            const g = { name: ge.getAttribute('name') || name, type: ge.getAttribute('type') || 'sphere' };
+            g.pos = _parseVec(ge.getAttribute('pos'), 3) || [0,0,0];
+            if (ge.getAttribute('size')) g.size = _parseVec(ge.getAttribute('size'));
+            if (g.type === 'sphere') g.radius = g.size[0];
+            else if (g.type === 'capsule') {
+                g.radius = g.size[0];
+                if (ge.getAttribute('fromto')) g.fromto = _parseVec(ge.getAttribute('fromto'), 6);
+            } else if (g.type === 'box') {
+                g.halfExtents = g.size.slice(0, 3);
+            } else if (g.type === 'cylinder') {
+                g.radius = g.size[0];
+                if (g.size.length > 1) g.halfHeight = g.size[1];
+                if (ge.getAttribute('fromto')) {
+                    g.fromto = _parseVec(ge.getAttribute('fromto'), 6);
+                    const ft = g.fromto;
+                    g.halfHeight = Math.sqrt((ft[3]-ft[0])**2+(ft[4]-ft[1])**2+(ft[5]-ft[2])**2) / 2;
+                }
+                if (!g.halfHeight) g.halfHeight = 0.1;
+            }
+            g.density = parseFloat(ge.getAttribute('density') || '1000');
+            geoms.push(g);
+        }
+
+        const PI = Math.PI;
+
+        function geomMassAndCenter(g) {
+            let volume = 0, center = g.pos.slice();
+            if (g.type === 'sphere') {
+                volume = (4/3) * PI * g.radius ** 3;
+            } else if (g.type === 'capsule' && g.fromto) {
+                const ft = g.fromto, r = g.radius;
+                const halfH = Math.sqrt((ft[3]-ft[0])**2+(ft[4]-ft[1])**2+(ft[5]-ft[2])**2) / 2;
+                volume = PI * r*r * (2*halfH) + (4/3) * PI * r**3;
+                center = [(ft[0]+ft[3])/2, (ft[1]+ft[4])/2, (ft[2]+ft[5])/2];
+            } else if (g.type === 'capsule') {
+                const r = g.radius, hh = g.size.length > 1 ? g.size[1] : 0.1;
+                volume = PI * r*r * (2*hh) + (4/3) * PI * r**3;
+            } else if (g.type === 'box') {
+                const he = g.halfExtents || g.size.slice(0,3);
+                volume = 8 * he[0] * he[1] * he[2];
+            } else if (g.type === 'cylinder') {
+                const r = g.radius, hh = g.halfHeight || 0.1;
+                volume = PI * r*r * (2*hh);
+                if (g.fromto) {
+                    const ft = g.fromto;
+                    center = [(ft[0]+ft[3])/2, (ft[1]+ft[4])/2, (ft[2]+ft[5])/2];
+                }
+            }
+            return { mass: volume * g.density, center, volume };
+        }
+
+        function capsuleInertia(g) {
+            const ft = g.fromto, r = g.radius;
+            const dx = ft[3]-ft[0], dy = ft[4]-ft[1], dz = ft[5]-ft[2];
+            const L = Math.sqrt(dx*dx+dy*dy+dz*dz);
+            const halfH = L / 2;
+            const cylVol = PI * r*r * L;
+            const cylM = cylVol * g.density;
+            const sphVol = (4/3) * PI * r**3;
+            const sphM = sphVol * g.density;
+            const cylIaxial = cylM * r*r / 2;
+            const cylIperp = cylM * (3*r*r + L*L) / 12;
+            const sphIaxial = 2 * sphM * r*r / 5;
+            const sphIperp = sphIaxial + sphM * (3*r/8 + halfH)**2;
+            const Iaxial = cylIaxial + sphIaxial;
+            const Iperp = cylIperp + sphIperp;
+            if (L < 1e-10) return [Iperp, Iperp, Iperp];
+            const ax = [dx/L, dy/L, dz/L];
+            return [
+                Iperp + (Iaxial - Iperp) * ax[0]*ax[0],
+                Iperp + (Iaxial - Iperp) * ax[1]*ax[1],
+                Iperp + (Iaxial - Iperp) * ax[2]*ax[2],
+            ];
+        }
+
+        let totalMass = 0;
+        let com = [0, 0, 0];
+        const geomData = geoms.map(g => {
+            const { mass, center } = geomMassAndCenter(g);
+            return { g, mass, center };
+        });
+        for (const { mass, center } of geomData) {
+            com[0] += mass * center[0];
+            com[1] += mass * center[1];
+            com[2] += mass * center[2];
+            totalMass += mass;
+        }
+        if (totalMass > 0) com = com.map(c => c / totalMass);
+
+        let inertia = [0, 0, 0];
+        for (const { g, mass, center } of geomData) {
+            let Ii;
+            if (g.type === 'sphere') {
+                const I = (2/5) * mass * g.radius**2;
+                Ii = [I, I, I];
+            } else if (g.type === 'capsule' && g.fromto) {
+                Ii = capsuleInertia(g);
+            } else if (g.type === 'box') {
+                const he = g.halfExtents || g.size.slice(0,3);
+                const a=2*he[0], b=2*he[1], c=2*he[2];
+                Ii = [mass*(b*b+c*c)/12, mass*(a*a+c*c)/12, mass*(a*a+b*b)/12];
+            } else if (g.type === 'cylinder') {
+                const r = g.radius, hh = g.halfHeight || 0.015;
+                const Iaxial = mass * r*r / 2;
+                const Iperp = mass * (3*r*r + (2*hh)**2) / 12;
+                if (g.fromto) {
+                    const ft = g.fromto, L = 2*hh;
+                    const ddx = ft[3]-ft[0], ddy = ft[4]-ft[1], ddz = ft[5]-ft[2];
+                    if (L > 1e-10) {
+                        const ax = [ddx/L, ddy/L, ddz/L];
+                        Ii = [Iperp + (Iaxial-Iperp)*ax[0]*ax[0],
+                              Iperp + (Iaxial-Iperp)*ax[1]*ax[1],
+                              Iperp + (Iaxial-Iperp)*ax[2]*ax[2]];
+                    } else { Ii = [Iperp, Iperp, Iaxial]; }
+                } else { Ii = [Iperp, Iperp, Iaxial]; }
+            } else {
+                Ii = [0, 0, 0];
+            }
+            const dx = center[0]-com[0], dy = center[1]-com[1], dz = center[2]-com[2];
+            inertia[0] += Ii[0] + mass*(dy*dy+dz*dz);
+            inertia[1] += Ii[1] + mass*(dx*dx+dz*dz);
+            inertia[2] += Ii[2] + mass*(dx*dx+dy*dy);
+        }
+
+        bodies.push({ name, parent: parentName, pos: worldPos, localPos, geoms,
+                       mass: totalMass, inertia, com });
+
+        const jointEls = [...el.querySelectorAll(':scope > joint')].filter(
+            j => (j.getAttribute('type') || 'hinge') !== 'free' && j.tagName !== 'freejoint');
+
+        if (fixedBodies.has(name)) {
+            fixedJoints.push({ name: name+'_fixed', parent_body: parentName, child_body: name, localPos0: localPos });
+        } else if (jointEls.length && parentName !== null) {
+            const axesData = [], jointAxes = [];
+            for (const je of jointEls) {
+                const axis = _parseVec(je.getAttribute('axis') || '1 0 0', 3);
+                jointAxes.push(axis);
+                const rng = _parseVec(je.getAttribute('range') || '-3.14159 3.14159', 2);
+                const jname = je.getAttribute('name');
+                const act = actuatorMap[jname] || { gear: 100, maxForce: 100 };
+                axesData.push({
+                    name: jname, mjcf_axis: axis,
+                    stiffness: parseFloat(je.getAttribute('stiffness') || '0'),
+                    damping: parseFloat(je.getAttribute('damping') || '0'),
+                    maxForce: act.maxForce,
+                    range: rng,
+                    armature: parseFloat(je.getAttribute('armature') || '0'),
+                });
+            }
+
+            const { q, axisMap } = _computeJointFrame(jointAxes);
+            const localRot = [q[3], q[0], q[1], q[2]];
+
+            joints.push({
+                name: jointEls.length > 1 ? jointEls[0].getAttribute('name').replace(/_[^_]+$/, '') : jointEls[0].getAttribute('name'),
+                parent_body: parentName, child_body: name,
+                axes: axesData,
+                axisMap: axisMap.slice(0, jointEls.length),
+                localPos0: localPos,
+                localRot,
+                jointType: jointEls.length > 1 ? 'spherical' : 'revolute',
+            });
+        }
+
+        for (const child of el.querySelectorAll(':scope > body'))
+            processBody(child, name, worldPos);
+    }
+
+    const worldbody = root.querySelector('worldbody');
+    const pelvis = worldbody.querySelector(':scope > body');
+    const pelvisPos = _parseVec(pelvis.getAttribute('pos'), 3) || [0,0,0];
+    processBody(pelvis, null, pelvisPos);
+
+    const dofInfo = [];
+    for (const actName of actuatorOrder) {
+        for (const jdata of joints) {
+            for (let ai = 0; ai < jdata.axes.length; ai++) {
+                if (jdata.axes[ai].name === actName) {
+                    dofInfo.push({
+                        joint_name: jdata.name, axis_name: actName,
+                        physx_axis: jdata.axisMap[ai], child_body: jdata.child_body,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    const bodyNames = bodies.map(b => b.name);
+    const fk_parent_indices = bodies.map(b => b.parent === null ? -1 : bodyNames.indexOf(b.parent));
+    const fk_local_translations = bodies.map(b => b.localPos);
+    const fk_local_rotations = bodies.map(() => [0, 0, 0, 1]);
+
+    const kinematicJoints = [];
+    let dofIdx = 0;
+    for (let bi = 1; bi < bodies.length; bi++) {
+        const bname = bodies[bi].name;
+        const jdata = joints.find(j => j.child_body === bname);
+        const fjdata = fixedJoints.find(j => j.child_body === bname);
+        if (jdata) {
+            const nDofs = jdata.axes.length;
+            kinematicJoints.push({
+                name: jdata.name, child_body: bname,
+                type: nDofs > 1 ? 'SPHERICAL' : 'HINGE',
+                dof_idx: dofIdx, dof_dim: nDofs,
+                axis: nDofs === 1 ? jdata.axes[0].mjcf_axis : undefined,
+            });
+            dofIdx += nDofs;
+        } else if (fjdata) {
+            kinematicJoints.push({ name: fjdata.name, child_body: bname, type: 'FIXED', dof_idx: dofIdx, dof_dim: 0 });
+        } else {
+            kinematicJoints.push({ name: bname, child_body: bname, type: 'FIXED', dof_idx: dofIdx, dof_dim: 0 });
+        }
+    }
+
+    return {
+        bodies, joints, fixedJoints, actuatorOrder, dofInfo,
+        fk_parent_indices, fk_local_translations, fk_local_rotations,
+        kinematicJoints,
+        act_dim: actuatorOrder.length,
+    };
+}
+</script>
+
+<!-- Import map for three.js -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import GUI from 'lil-gui';
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+let PhysX, physics, pxScene, foundation, material;
+let articulation, links = [];  // { name, link, meshGroup }
+let humanoidData = {};
+let onnxSessionHLC;    // HLC: obs + task_obs → latent z
+let onnxSessionLLC;    // LLC: obs + latent → action (shared across tasks, also serves ASE latent mode)
+let renderer, camera, scene3d, controls, worldGroup;
+let latentVec;
+let running = false;
+let currentMode = 'hrl';  // 'hrl' or 'ase'
+let frameCount = 0, lastFpsTime = 0;
+
+// PhysX enums (set after PhysX loads)
+let E_TWIST, E_SWING1, E_SWING2;
+let E_LIMITED, E_LOCKED;
+let E_SPHERICAL, E_REVOLUTE, E_FIX;
+let E_FORCE, E_CACHE_ALL;
+let SHAPE_FLAGS_VAL;
+let groundActor;
+let groundRemoved = false;
+
+// Strike target (PhysX dynamic pillar — tall box that can be knocked over)
+let strikeTargetActor = null;
+let strikeTargetMesh = null;
+// Pillar: 0.4 x 0.4 x 1.8m (half-extents 0.2, 0.2, 0.9)
+const PILLAR_HX = 0.2, PILLAR_HY = 0.2, PILLAR_HZ = 0.9;
+const PILLAR_DENSITY = 30.0;  // matching ASE
+const PILLAR_SPAWN_HEIGHT = 0.9;  // center of pillar when standing
+const NEAR_DIST = 1.5;
+const NEAR_PROB = 0.5;
+const TAR_DIST_MIN = 0.5;
+const TAR_DIST_MAX = 10.0;
+
+// Body indices in the links array
+const SWORD_BODY_INDEX = 6;
+const SHIELD_BODY_INDEX = 9;
+
+// Drag interaction state
+let dragState = {
+    active: false,
+    mouseDown: false,
+    physicsBody: null,
+    grabDistance: 0,
+    localHit: null,
+    worldHit: null,
+    currentWorld: null,
+    arrow: null,
+    raycaster: null,
+    mousePos: null,
+    lastClientX: 0,
+    lastClientY: 0,
+    _hitObject: null,
+};
+const DRAG_STIFFNESS = 250;
+
+let numSubsteps = 4;
+const DT = 1 / 120;
+const CONTROL_DT = 1 / 30;
+
+let drivesEnabled = true;
+let policyEnabled = true;
+let selfCollisionEnabled = false;
+let gravityEnabled = true;
+let stiffnessScale = 1.0;
+let dampingScale = 1.0;
+let timeScale = 1.0;
+let prevAction = null;
+let origDrives = [];
+let currentAction = null;
+let resetGraceFrames = 60;
+const RESET_GRACE = 90;
+
+function quatFromTwoVec(from, to) {
+    const [fx,fy,fz] = from, [tx,ty,tz] = to;
+    const dot = fx*tx + fy*ty + fz*tz;
+    if (dot > 0.999999) return [0,0,0,1];
+    if (dot < -0.999999) {
+        let ax = [0, -fz, fy];
+        if (Math.abs(fx) > 0.9) ax = [fz, 0, -fx];
+        const len = Math.sqrt(ax[0]*ax[0]+ax[1]*ax[1]+ax[2]*ax[2]);
+        return [ax[0]/len, ax[1]/len, ax[2]/len, 0];
+    }
+    const cx = fy*tz - fz*ty, cy = fz*tx - fx*tz, cz = fx*ty - fy*tx;
+    const w = 1 + dot;
+    const len = Math.sqrt(cx*cx + cy*cy + cz*cz + w*w);
+    return [cx/len, cy/len, cz/len, w/len];
+}
+
+function setStatus(msg) {
+    document.getElementById('loadStatus').textContent = msg;
+}
+
+function gaussianRandom() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+// ---------------------------------------------------------------------------
+// Load humanoid JSON
+// ---------------------------------------------------------------------------
+async function loadHumanoidData() {
+    setStatus('Loading character data...');
+
+    if (!humanoidData.bodies) throw new Error('No character data in ONNX metadata');
+
+    if (humanoidData.kinematicJoints) {
+        for (const kj of humanoidData.kinematicJoints) {
+            if (kj.type !== 'SPHERICAL') continue;
+            for (let d = 0; d < 3; d++)
+                humanoidData.dofInfo[kj.dof_idx + d].physx_axis = d;
+        }
+        for (const jdata of humanoidData.joints) {
+            if (jdata.jointType === 'spherical' && jdata.axisMap)
+                jdata.axisMap = [0, 1, 2];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Load ONNX model + extract baked metadata
+// ---------------------------------------------------------------------------
+let onnxBuffer = null;
+
+async function loadOnnxModel() {
+    setStatus('Loading ONNX models...');
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
+
+    // Load LLC (shared across all tasks + ASE latent mode)
+    // LLC has the baked metadata (MJCF, normalizers, etc.)
+    const llcResp = await fetch('./llc_sword_shield.onnx');
+    onnxBuffer = await llcResp.arrayBuffer();
+    onnxSessionLLC = await ort.InferenceSession.create(onnxBuffer, { executionProviders: ['wasm'] });
+    console.log('LLC loaded (' + (onnxBuffer.byteLength / 1024 / 1024).toFixed(1) + ' MB)');
+
+    // Load HLC for strike task
+    try {
+        const hlcResp = await fetch('./hlc_strike.onnx');
+        const hlcBuf = await hlcResp.arrayBuffer();
+        onnxSessionHLC = await ort.InferenceSession.create(hlcBuf, { executionProviders: ['wasm'] });
+        console.log('HLC strike loaded (' + (hlcBuf.byteLength / 1024 / 1024).toFixed(1) + ' MB)');
+    } catch(e) {
+        console.warn('Could not load HLC model (HRL mode disabled):', e.message);
+    }
+
+    // Extract metadata from LLC (it has the full baked config)
+    const meta = extractOnnxMetadata(onnxBuffer);
+    onnxBuffer = null;
+
+    if (meta) {
+        const fields = ['obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
+                        'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
+                        'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z'];
+        for (const f of fields) {
+            if (meta[f] !== undefined) humanoidData[f] = meta[f];
+        }
+        if (meta.mjcf_xml && !humanoidData.bodies) {
+            const mjcfData = parseMJCF(meta.mjcf_xml);
+            Object.assign(humanoidData, mjcfData);
+            console.log('Parsed MJCF from ONNX metadata:', humanoidData.bodies.length, 'bodies');
+        }
+    }
+}
+
+function extractOnnxMetadata(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const sentinel = 'mimickit_config';
+    const sentinelBytes = new TextEncoder().encode(sentinel);
+
+    for (let i = 0; i < bytes.length - sentinelBytes.length - 10; i++) {
+        let match = true;
+        for (let j = 0; j < sentinelBytes.length; j++) {
+            if (bytes[i + j] !== sentinelBytes[j]) { match = false; break; }
+        }
+        if (!match) continue;
+
+        const searchStart = i + sentinelBytes.length;
+        for (let k = searchStart; k < Math.min(searchStart + 20, bytes.length); k++) {
+            if (bytes[k] === 0x12) {
+                let len = 0, shift = 0, pos = k + 1;
+                while (pos < bytes.length) {
+                    const b = bytes[pos++];
+                    len |= (b & 0x7f) << shift;
+                    shift += 7;
+                    if ((b & 0x80) === 0) break;
+                }
+                if (len > 0 && pos + len <= bytes.length) {
+                    const jsonStr = new TextDecoder().decode(bytes.slice(pos, pos + len));
+                    try {
+                        const config = JSON.parse(jsonStr);
+                        console.log('Extracted ONNX metadata (' + Object.keys(config).length + ' keys, ' +
+                            Math.round(len/1024) + 'KB)');
+                        return config;
+                    } catch(e) {
+                        console.log('Found sentinel but JSON parse failed:', e.message);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    console.log('No mimickit_config found in ONNX binary');
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Init PhysX
+// ---------------------------------------------------------------------------
+async function initPhysX() {
+    setStatus('Loading PhysX WASM...');
+
+    const module = await import('https://cdn.jsdelivr.net/npm/physx-js-webidl@2.7.2/physx-js-webidl.mjs');
+    PhysX = await module.default({
+        locateFile: () => 'https://cdn.jsdelivr.net/npm/physx-js-webidl@2.7.2/physx-js-webidl.wasm'
+    });
+    console.log('PhysX WASM loaded');
+
+    E_TWIST   = PhysX.PxArticulationAxisEnum.eTWIST;
+    E_SWING1  = PhysX.PxArticulationAxisEnum.eSWING1;
+    E_SWING2  = PhysX.PxArticulationAxisEnum.eSWING2;
+    E_LIMITED = PhysX.PxArticulationMotionEnum.eLIMITED;
+    E_LOCKED  = PhysX.PxArticulationMotionEnum.eLOCKED;
+    E_SPHERICAL = PhysX.PxArticulationJointTypeEnum.eSPHERICAL;
+    E_REVOLUTE  = PhysX.PxArticulationJointTypeEnum.eREVOLUTE;
+    E_FIX       = PhysX.PxArticulationJointTypeEnum.eFIX;
+    E_FORCE     = PhysX.PxArticulationDriveTypeEnum.eFORCE;
+    E_CACHE_ALL = PhysX.PxArticulationCacheFlagEnum.eALL;
+    SHAPE_FLAGS_VAL = PhysX.PxShapeFlagEnum.eSCENE_QUERY_SHAPE | PhysX.PxShapeFlagEnum.eSIMULATION_SHAPE;
+
+    const tlf = PhysX.PxTopLevelFunctions.prototype;
+    const version = PhysX.PHYSICS_VERSION;
+    const allocator = new PhysX.PxDefaultAllocator();
+    const errorCb = new PhysX.PxDefaultErrorCallback();
+    foundation = tlf.CreateFoundation(version, allocator, errorCb);
+
+    const tolerances = new PhysX.PxTolerancesScale();
+    physics = tlf.CreatePhysics(version, foundation, tolerances);
+
+    const cpuDispatcher = tlf.DefaultCpuDispatcherCreate(0);
+    const sceneDesc = new PhysX.PxSceneDesc(tolerances);
+    sceneDesc.set_gravity(new PhysX.PxVec3(0, 0, -9.81));
+    sceneDesc.set_cpuDispatcher(cpuDispatcher);
+    sceneDesc.set_filterShader(tlf.DefaultFilterShader());
+    sceneDesc.set_bounceThresholdVelocity(0.2);
+    if (PhysX.PxSolverTypeEnum && PhysX.PxSolverTypeEnum.ePGS !== undefined) {
+        sceneDesc.set_solverType(PhysX.PxSolverTypeEnum.ePGS);
+        console.log('Using PGS solver (matching Isaac Lab)');
+    } else {
+        console.log('PGS solver enum not found, using default (should be PGS)');
+    }
+    if (typeof sceneDesc.set_frictionType === 'function') {
+        sceneDesc.set_frictionType(PhysX.PxFrictionTypeEnum.ePATCH);
+    }
+    if (typeof sceneDesc.set_frictionCorrelationDistance === 'function') {
+        sceneDesc.set_frictionCorrelationDistance(0.025);
+    }
+    if (typeof sceneDesc.set_frictionOffsetThreshold === 'function') {
+        sceneDesc.set_frictionOffsetThreshold(0.04);
+    }
+    if (typeof sceneDesc.set_maxBiasCoefficient === 'function') {
+        sceneDesc.set_maxBiasCoefficient(100);
+    }
+    pxScene = physics.createScene(sceneDesc);
+
+    material = physics.createMaterial(1.0, 1.0, 0.0);
+
+    const groundShapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
+    const groundGeom = new PhysX.PxBoxGeometry(50, 50, 0.5);
+    const groundShape = physics.createShape(groundGeom, material, true, groundShapeFlags);
+    const groundFilterData = new PhysX.PxFilterData(1, 7, 0, 0);
+    groundShape.setSimulationFilterData(groundFilterData);
+    const groundPose = new PhysX.PxTransform(
+        new PhysX.PxVec3(0, 0, -0.5),
+        new PhysX.PxQuat(0, 0, 0, 1)
+    );
+    groundActor = physics.createRigidStatic(groundPose);
+    groundActor.attachShape(groundShape);
+    pxScene.addActor(groundActor);
+    groundRemoved = false;
+
+    console.log('PhysX scene created');
+}
+
+// ---------------------------------------------------------------------------
+// Build PhysX articulation from humanoid data
+// ---------------------------------------------------------------------------
+function buildArticulation() {
+    setStatus('Building humanoid articulation...');
+
+    const shapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
+    const rbext = PhysX.PxRigidBodyExt.prototype;
+
+    articulation = physics.createArticulationReducedCoordinate();
+    articulation.setSolverIterationCounts(4, 0);
+    if (typeof articulation.setSleepThreshold === 'function') {
+        articulation.setSleepThreshold(5e-5);
+    }
+    if (typeof articulation.setStabilizationThreshold === 'function') {
+        articulation.setStabilizationThreshold(1e-5);
+    }
+    articulation.setArticulationFlag(
+        PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
+    );
+
+    const bodyLinkMap = {};
+    links = [];
+
+    for (const body of humanoidData.bodies) {
+        const wp = body.pos;
+        const zOff = humanoidData.tpose_pelvis_z || humanoidData.pelvis_z;
+        const pose = new PhysX.PxTransform(
+            new PhysX.PxVec3(wp[0], wp[1], wp[2] + zOff),
+            new PhysX.PxQuat(0, 0, 0, 1)
+        );
+
+        const parentLink = body.parent ? bodyLinkMap[body.parent] : null;
+        const link = articulation.createLink(parentLink, pose);
+
+        for (const geom of body.geoms) {
+            let shape = null;
+            if (geom.type === 'sphere') {
+                const g = new PhysX.PxSphereGeometry(geom.radius);
+                shape = physics.createShape(g, material, true, shapeFlags);
+                const lp = geom.pos;
+                shape.setLocalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                    new PhysX.PxQuat(0, 0, 0, 1)
+                ));
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const p0 = [ft[0], ft[1], ft[2]];
+                const p1 = [ft[3], ft[4], ft[5]];
+                const dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
+                const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                const halfH = Math.max(len / 2, 0.001);
+                const g = new PhysX.PxCapsuleGeometry(geom.radius, halfH);
+                shape = physics.createShape(g, material, true, shapeFlags);
+                const mid = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2, (p0[2]+p1[2])/2];
+                const dir = len > 0.001 ? [dx/len, dy/len, dz/len] : [1,0,0];
+                const q = quatFromTwoVec([1,0,0], dir);
+                shape.setLocalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(mid[0], mid[1], mid[2]),
+                    new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                ));
+            } else if (geom.type === 'box') {
+                const he = geom.halfExtents;
+                const g = new PhysX.PxBoxGeometry(he[0], he[1], he[2]);
+                shape = physics.createShape(g, material, true, shapeFlags);
+                const lp = geom.pos;
+                shape.setLocalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                    new PhysX.PxQuat(0, 0, 0, 1)
+                ));
+            } else if (geom.type === 'cylinder') {
+                const r = geom.radius;
+                const hh = geom.halfHeight || 0.015;
+                const nSides = 16;
+
+                const vec = new PhysX.Vector_PxVec3();
+                for (let ring = 0; ring < 2; ring++) {
+                    const z = ring === 0 ? -hh : hh;
+                    for (let i = 0; i < nSides; i++) {
+                        const a = (2 * Math.PI * i) / nSides;
+                        vec.push_back(new PhysX.PxVec3(r * Math.cos(a), r * Math.sin(a), z));
+                    }
+                }
+                const desc = new PhysX.PxConvexMeshDesc();
+                const bd = new PhysX.PxBoundedData();
+                bd.set_count(vec.size());
+                bd.set_stride(12);
+                bd.set_data(vec.data());
+                desc.set_points(bd);
+                desc.set_flags(new PhysX.PxConvexFlags(PhysX.PxConvexFlagEnum.eCOMPUTE_CONVEX));
+                const cookParams = new PhysX.PxCookingParams(new PhysX.PxTolerancesScale());
+                const convexMesh = PhysX.PxTopLevelFunctions.prototype.CreateConvexMesh(cookParams, desc);
+
+                if (convexMesh) {
+                    const g = new PhysX.PxConvexMeshGeometry(convexMesh);
+                    shape = physics.createShape(g, material, true, shapeFlags);
+
+                    if (geom.fromto) {
+                        const ft = geom.fromto;
+                        const p0 = [ft[0], ft[1], ft[2]], p1 = [ft[3], ft[4], ft[5]];
+                        const mid = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2, (p0[2]+p1[2])/2];
+                        const dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
+                        const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                        const dir = len > 0.001 ? [dx/len, dy/len, dz/len] : [0,0,1];
+                        const q = quatFromTwoVec([0,0,1], dir);
+                        shape.setLocalPose(new PhysX.PxTransform(
+                            new PhysX.PxVec3(mid[0], mid[1], mid[2]),
+                            new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                        ));
+                    } else {
+                        const lp = geom.pos || [0,0,0];
+                        shape.setLocalPose(new PhysX.PxTransform(
+                            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                            new PhysX.PxQuat(0, 0, 0, 1)
+                        ));
+                    }
+                } else {
+                    console.warn('Convex mesh cooking failed for cylinder, falling back to capsule');
+                    const g = new PhysX.PxCapsuleGeometry(r, hh);
+                    shape = physics.createShape(g, material, true, shapeFlags);
+                    const lp = geom.pos || [0,0,0];
+                    const q = quatFromTwoVec([1,0,0], [0,0,1]);
+                    shape.setLocalPose(new PhysX.PxTransform(
+                        new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                        new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                    ));
+                }
+            }
+            if (shape) {
+                shape.setSimulationFilterData(new PhysX.PxFilterData(2, 5, 0, 0));
+                link.attachShape(shape);
+            }
+        }
+
+        if (body.mass && body.inertia && body.com) {
+            link.setMass(body.mass);
+            link.setMassSpaceInertiaTensor(new PhysX.PxVec3(body.inertia[0], body.inertia[1], body.inertia[2]));
+            link.setCMassLocalPose(new PhysX.PxTransform(
+                new PhysX.PxVec3(body.com[0], body.com[1], body.com[2]),
+                new PhysX.PxQuat(0, 0, 0, 1)
+            ));
+        } else if (body.mass) {
+            rbext.setMassAndUpdateInertia(link, body.mass);
+        } else {
+            rbext.updateMassAndInertia(link, 1000);
+        }
+
+        link.setAngularDamping(0.01);
+        link.setLinearDamping(0.0);
+        link.setMaxDepenetrationVelocity(10.0);
+        link.setMaxLinearVelocity(1000.0);
+        link.setMaxAngularVelocity(1000.0);
+        if (typeof link.setSleepThreshold === 'function') {
+            link.setSleepThreshold(5e-5);
+        }
+        if (typeof link.setStabilizationThreshold === 'function') {
+            link.setStabilizationThreshold(1e-5);
+        }
+        if (typeof link.setCfmScale === 'function') {
+            link.setCfmScale(0.025);
+        }
+        if (typeof link.setRigidBodyFlag === 'function') {
+            try { link.setRigidBodyFlag(PhysX.PxRigidBodyFlagEnum.eENABLE_GYROSCOPIC_FORCES, true); } catch(e) {}
+        }
+
+        bodyLinkMap[body.name] = link;
+        links.push({ name: body.name, link: link, meshGroup: null });
+    }
+
+    // Configure joints
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    origDrives.length = 0;
+    const driveScale = 1.0;
+
+    for (const jdata of humanoidData.joints) {
+        const childLink = bodyLinkMap[jdata.child_body];
+        const joint = childLink.getInboundJoint();
+
+        if (jdata.jointType === 'spherical') {
+            joint.setJointType(E_SPHERICAL);
+        } else {
+            joint.setJointType(E_REVOLUTE);
+        }
+
+        joint.setFrictionCoefficient(0);
+        if (typeof joint.setMaxJointVelocity === 'function') {
+            joint.setMaxJointVelocity(1000000);
+        }
+
+        const lp = jdata.localPos0;
+        const lr = jdata.localRot;
+
+        const parentPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])
+        );
+        const childPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, 0),
+            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])
+        );
+        joint.setParentPose(parentPose);
+        joint.setChildPose(childPose);
+
+        if (jdata.jointType === 'spherical') {
+            for (let i = 0; i < jdata.axes.length; i++) {
+                const physAxis = jdata.axisMap[i];
+                const axE = axisEnums[physAxis];
+                joint.setMotion(axE, E_LIMITED);
+                const ax = jdata.axes[i];
+                const limit = new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]);
+                joint.setLimitParams(axE, limit);
+                const drive = new PhysX.PxArticulationDrive(
+                    ax.stiffness * driveScale, ax.damping * driveScale, ax.maxForce, E_FORCE
+                );
+                joint.setDriveParams(axE, drive);
+                if (ax.armature !== undefined) joint.setArmature(axE, ax.armature);
+                origDrives.push({joint, axisEnum: axE, stiffness: ax.stiffness * driveScale, damping: ax.damping * driveScale, maxForce: ax.maxForce});
+            }
+            for (let i = jdata.axes.length; i < 3; i++) {
+                joint.setMotion(axisEnums[i], E_LOCKED);
+            }
+        } else {
+            joint.setMotion(E_TWIST, E_LIMITED);
+            const ax = jdata.axes[0];
+            joint.setLimitParams(E_TWIST, new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]));
+            const revDrive = new PhysX.PxArticulationDrive(
+                ax.stiffness * driveScale, ax.damping * driveScale, ax.maxForce, E_FORCE
+            );
+            joint.setDriveParams(E_TWIST, revDrive);
+            if (ax.armature !== undefined) joint.setArmature(E_TWIST, ax.armature);
+            origDrives.push({joint, axisEnum: E_TWIST, stiffness: ax.stiffness * driveScale, damping: ax.damping * driveScale, maxForce: ax.maxForce});
+            joint.setMotion(E_SWING1, E_LOCKED);
+            joint.setMotion(E_SWING2, E_LOCKED);
+        }
+    }
+
+    // Fixed joints
+    for (const fj of humanoidData.fixedJoints) {
+        const childLink = bodyLinkMap[fj.child_body];
+        const joint = childLink.getInboundJoint();
+        joint.setJointType(E_FIX);
+        const lp = fj.localPos0;
+        joint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+            new PhysX.PxQuat(0, 0, 0, 1)
+        ));
+        joint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, 0),
+            new PhysX.PxQuat(0, 0, 0, 1)
+        ));
+    }
+
+    removeGround();
+    pxScene.addArticulation(articulation);
+    console.log('Articulation built with', links.length, 'links,', articulation.getDofs(), 'DOFs');
+
+    applyInitPose();
+    scheduleGroundRestore();
+}
+
+function applyInitPose() {
+    if (!humanoidData.init_root_pos || !humanoidData.init_dof_pos) return;
+
+    const rp = humanoidData.init_root_pos;
+    const rq = humanoidData.init_root_rot_quat;
+    const initDof = humanoidData.init_dof_pos;
+
+    articulation.setRootGlobalPose(new PhysX.PxTransform(
+        new PhysX.PxVec3(rp[0], rp[1], rp[2]),
+        new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])), true);
+    const axisEnumsInit = [E_TWIST, E_SWING1, E_SWING2];
+    const bodyLinkMapInit = {};
+    for (const l of links) bodyLinkMapInit[l.name] = l.link;
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const cl = bodyLinkMapInit[dof.child_body];
+        if (!cl) continue;
+        try {
+            cl.getInboundJoint().setJointPosition(axisEnumsInit[dof.physx_axis], initDof[i]);
+            cl.getInboundJoint().setJointVelocity(axisEnumsInit[dof.physx_axis], 0);
+        } catch(e) {}
+    }
+    removeGround();
+    const initFlags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+    const initCache = articulation.createCache();
+    articulation.copyInternalStateToCache(initCache, initFlags);
+    articulation.applyCache(initCache, initFlags, true);
+    restoreGround();
+
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (!childLink) continue;
+        try {
+            childLink.getInboundJoint().setDriveTarget(axisEnums[dof.physx_axis], initDof[i]);
+        } catch(e) {}
+    }
+
+    console.log('Applied init_pose via cache FK: root_z=' + rp[2] + ', dofs=' + initDof.length);
+}
+
+// ---------------------------------------------------------------------------
+// Ground collision control
+// ---------------------------------------------------------------------------
+function removeGround() { if (groundActor && !groundRemoved) { pxScene.removeActor(groundActor); groundRemoved = true; } }
+function restoreGround() { if (groundActor && groundRemoved) { pxScene.addActor(groundActor); groundRemoved = false; } }
+let restoreGroundAfterStep = false;
+function scheduleGroundRestore() { restoreGroundAfterStep = true; }
+
+// ---------------------------------------------------------------------------
+// Strike target (PhysX dynamic sphere, anti-gravity each physics step)
+// ---------------------------------------------------------------------------
+function createStrikeTargetPhysX() {
+    if (strikeTargetActor) return;
+    const shapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
+    const boxGeom = new PhysX.PxBoxGeometry(PILLAR_HX, PILLAR_HY, PILLAR_HZ);
+    const boxShape = physics.createShape(boxGeom, material, true, shapeFlags);
+    // Collides with humanoid (group 2) and ground (group 1)
+    boxShape.setSimulationFilterData(new PhysX.PxFilterData(4, 3, 0, 0));
+    const pose = new PhysX.PxTransform(
+        new PhysX.PxVec3(2, 0, PILLAR_SPAWN_HEIGHT),
+        new PhysX.PxQuat(0, 0, 0, 1)
+    );
+    strikeTargetActor = physics.createRigidDynamic(pose);
+    strikeTargetActor.attachShape(boxShape);
+    // Mass from density * volume: 30 * (0.4 * 0.4 * 1.8) = 8.64 kg
+    const mass = PILLAR_DENSITY * (PILLAR_HX*2) * (PILLAR_HY*2) * (PILLAR_HZ*2);
+    PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(strikeTargetActor, mass);
+    strikeTargetActor.setAngularDamping(0.01);
+    strikeTargetActor.setLinearDamping(0.01);
+    pxScene.addActor(strikeTargetActor);
+    console.log('Created PhysX strike pillar, mass=' + mass.toFixed(1) + 'kg');
+}
+
+function getStrikeTargetPos() {
+    if (!strikeTargetActor) return [2, 0, PILLAR_SPAWN_HEIGHT];
+    const p = strikeTargetActor.getGlobalPose().get_p();
+    return [p.get_x(), p.get_y(), p.get_z()];
+}
+
+function getStrikeTargetRot() {
+    if (!strikeTargetActor) return [0, 0, 0, 1];
+    const q = strikeTargetActor.getGlobalPose().get_q();
+    return [q.get_x(), q.get_y(), q.get_z(), q.get_w()];
+}
+
+function getStrikeTargetVel() {
+    if (!strikeTargetActor) return [0, 0, 0];
+    const v = strikeTargetActor.getLinearVelocity();
+    return [v.get_x(), v.get_y(), v.get_z()];
+}
+
+function getStrikeTargetAngVel() {
+    if (!strikeTargetActor) return [0, 0, 0];
+    const v = strikeTargetActor.getAngularVelocity();
+    return [v.get_x(), v.get_y(), v.get_z()];
+}
+
+function resetStrikeTarget() {
+    if (!strikeTargetActor) return;
+    const rootPose = links[0].link.getGlobalPose();
+    const rp = rootPose.get_p();
+
+    // 50% near (<1.5m), 50% far (up to 10m) — matching ASE
+    const isNear = Math.random() < NEAR_PROB;
+    const distMax = isNear ? NEAR_DIST : TAR_DIST_MAX;
+    const dist = TAR_DIST_MIN + Math.random() * (distMax - TAR_DIST_MIN);
+    const angle = Math.random() * 2 * Math.PI;
+
+    const tx = rp.get_x() + dist * Math.cos(angle);
+    const ty = rp.get_y() + dist * Math.sin(angle);
+
+    // Random yaw rotation, standing upright
+    const yaw = Math.random() * 2 * Math.PI;
+    const ha = yaw * 0.5;
+    const qz = Math.sin(ha), qw = Math.cos(ha);
+
+    const newPose = new PhysX.PxTransform(
+        new PhysX.PxVec3(tx, ty, PILLAR_SPAWN_HEIGHT),
+        new PhysX.PxQuat(0, 0, qz, qw)
+    );
+    strikeTargetActor.setGlobalPose(newPose);
+    strikeTargetActor.setLinearVelocity(new PhysX.PxVec3(0, 0, 0));
+    strikeTargetActor.setAngularVelocity(new PhysX.PxVec3(0, 0, 0));
+
+    console.log('Pillar reset: dist=' + dist.toFixed(1) + 'm, near=' + isNear);
+}
+
+function updateStrikeTarget() {
+    // Update mesh from PhysX pose (position + rotation)
+    if (strikeTargetMesh && strikeTargetActor) {
+        const pose = strikeTargetActor.getGlobalPose();
+        const p = pose.get_p();
+        const q = pose.get_q();
+        strikeTargetMesh.position.set(p.get_x(), p.get_y(), p.get_z());
+        strikeTargetMesh.quaternion.set(q.get_x(), q.get_y(), q.get_z(), q.get_w());
+    }
+}
+
+function createStrikeTargetMesh() {
+    if (strikeTargetMesh) return;
+    // Box geometry: Three.js uses full dimensions, not half-extents
+    const geo = new THREE.BoxGeometry(PILLAR_HX*2, PILLAR_HY*2, PILLAR_HZ*2);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xb0c0d8, roughness: 0.5, metalness: 0.2 });
+    strikeTargetMesh = new THREE.Mesh(geo, mat);
+    strikeTargetMesh.castShadow = true;
+    strikeTargetMesh.receiveShadow = true;
+    const initPos = getStrikeTargetPos();
+    strikeTargetMesh.position.set(initPos[0], initPos[1], initPos[2]);
+    worldGroup.add(strikeTargetMesh);
+}
+
+// ---------------------------------------------------------------------------
+// Debug helpers
+// ---------------------------------------------------------------------------
+function applyDriveParams() {
+    for (const d of origDrives) {
+        const drive = new PhysX.PxArticulationDrive(
+            drivesEnabled ? d.stiffness * stiffnessScale : 0,
+            drivesEnabled ? d.damping * dampingScale : 0,
+            drivesEnabled ? d.maxForce : 0,
+            E_FORCE
+        );
+        d.joint.setDriveParams(d.axisEnum, drive);
+    }
+}
+
+function setSelfCollision(enabled) {
+    selfCollisionEnabled = enabled;
+    articulation.setArticulationFlag(
+        PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, !enabled
+    );
+    for (const entry of links) {
+        try {
+            const nbShapes = entry.link.getNbShapes();
+            for (let si = 0; si < nbShapes; si++) {
+                const shape = (typeof entry.link.getShape === 'function')
+                    ? entry.link.getShape(si)
+                    : entry.link.getShapeAt ? entry.link.getShapeAt(si) : null;
+                if (!shape) continue;
+                if (enabled) {
+                    shape.setSimulationFilterData(new PhysX.PxFilterData(2, 7, 0, 0));
+                } else {
+                    shape.setSimulationFilterData(new PhysX.PxFilterData(2, 1, 0, 0));
+                }
+            }
+        } catch(e) {}
+    }
+}
+
+function setGravity(enabled) {
+    gravityEnabled = enabled;
+    if (enabled) {
+        pxScene.setGravity(new PhysX.PxVec3(0, 0, -9.81));
+    } else {
+        pxScene.setGravity(new PhysX.PxVec3(0, 0, 0));
+    }
+}
+
+function updateDebugInfo() {
+    try {
+        const rootLink = links[0].link;
+        const pose = rootLink.getGlobalPose();
+        const vel = rootLink.getLinearVelocity();
+        const rootZ = pose.get_p().get_z();
+        const speed = Math.sqrt(vel.get_x()**2 + vel.get_y()**2 + vel.get_z()**2);
+
+        let maxDofVel = 0;
+        try {
+            for (const d of origDrives) {
+                const v = Math.abs(d.joint.getJointVelocity(d.axisEnum));
+                if (v > maxDofVel) maxDofVel = v;
+            }
+        } catch(e) {}
+
+        if (window._guiStats) {
+            window._guiStats.root_z = +rootZ.toFixed(3);
+            window._guiStats.root_speed = +speed.toFixed(3);
+            window._guiStats.max_dof_vel = +maxDofVel.toFixed(1);
+        }
+    } catch(e) {}
+}
+
+// ---------------------------------------------------------------------------
+// Three.js setup
+// ---------------------------------------------------------------------------
+const BODY_COLORS = {
+    pelvis: 0x5577aa, torso: 0x5577aa, head: 0xcc8866,
+    right_upper_arm: 0x77aa55, right_lower_arm: 0x77aa55, right_hand: 0xcc8866,
+    sword: 0xcccccc,
+    left_upper_arm: 0xaa7755, left_lower_arm: 0xaa7755, shield: 0x8888cc, left_hand: 0xcc8866,
+    right_thigh: 0x5577aa, right_shin: 0x5577aa, right_foot: 0x555577,
+    left_thigh: 0x5577aa, left_shin: 0x5577aa, left_foot: 0x555577,
+};
+
+function initThreeJS() {
+    setStatus('Setting up renderer...');
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    document.body.appendChild(renderer.domElement);
+
+    scene3d = new THREE.Scene();
+    scene3d.background = new THREE.Color(0x1a1a2e);
+    scene3d.fog = new THREE.Fog(0x1a1a2e, 15, 40);
+
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(3, 2, 4);
+    camera.lookAt(0, 1, 0);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+    controls.update();
+
+    // Lights
+    scene3d.add(new THREE.AmbientLight(0x404060, 0.6));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 30;
+    dirLight.shadow.camera.left = -5;
+    dirLight.shadow.camera.right = 5;
+    dirLight.shadow.camera.top = 5;
+    dirLight.shadow.camera.bottom = -5;
+    scene3d.add(dirLight);
+    scene3d.add(new THREE.HemisphereLight(0x8888cc, 0x444422, 0.4));
+
+    // World group: rotates Z-up (PhysX/MJCF) to Y-up (Three.js)
+    worldGroup = new THREE.Group();
+    worldGroup.rotation.x = -Math.PI / 2;
+    scene3d.add(worldGroup);
+
+    // Ground plane + grid
+    const groundGeo = new THREE.PlaneGeometry(40, 40);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a4a, roughness: 0.9, metalness: 0.1 });
+    const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+    groundMesh.receiveShadow = true;
+    const grid = new THREE.GridHelper(40, 40, 0x3a3a5e, 0x2a2a4a);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = 0.001;
+    worldGroup.add(groundMesh);
+    worldGroup.add(grid);
+
+    // Create meshes per body
+    for (let bi = 0; bi < humanoidData.bodies.length; bi++) {
+        const body = humanoidData.bodies[bi];
+        const group = new THREE.Group();
+        const color = BODY_COLORS[body.name] || 0x888888;
+
+        for (const geom of body.geoms) {
+            const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2 });
+            let mesh = null;
+
+            if (geom.type === 'sphere') {
+                mesh = new THREE.Mesh(new THREE.SphereGeometry(geom.radius, 16, 12), mat);
+                const lp = geom.pos;
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+                const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+                const dir = new THREE.Vector3().subVectors(p1, p0);
+                const len = dir.length();
+                mesh = new THREE.Mesh(new THREE.CapsuleGeometry(geom.radius, len, 8, 12), mat);
+                mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                if (len > 0.001) {
+                    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                }
+            } else if (geom.type === 'box') {
+                const he = geom.halfExtents;
+                mesh = new THREE.Mesh(new THREE.BoxGeometry(he[0]*2, he[1]*2, he[2]*2), mat);
+                const lp = geom.pos;
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'cylinder') {
+                const r = geom.radius;
+                if (geom.fromto) {
+                    const ft = geom.fromto;
+                    const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+                    const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+                    const dir = new THREE.Vector3().subVectors(p1, p0);
+                    const len = Math.max(dir.length(), 0.01);
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 16), mat);
+                    mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                    if (len > 0.001) {
+                        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                    }
+                } else {
+                    const hh = geom.halfHeight || 0.015;
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, hh*2, 16), mat);
+                    const lp = geom.pos || [0,0,0];
+                    mesh.position.set(lp[0], lp[1], lp[2]);
+                }
+            }
+            if (mesh) {
+                mesh.castShadow = true;
+                mesh.userData.bodyIndex = bi;
+                group.add(mesh);
+            }
+        }
+
+        worldGroup.add(group);
+        links[bi].meshGroup = group;
+    }
+
+    // Initialize drag interaction
+    initDragControls();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Drag interaction
+// ---------------------------------------------------------------------------
+function threeToPhysX(v) { return new THREE.Vector3(v.x, -v.z, v.y); }
+
+function initDragControls() {
+    dragState.raycaster = new THREE.Raycaster();
+    dragState.mousePos = new THREE.Vector2();
+    dragState.localHit = new THREE.Vector3();
+    dragState.worldHit = new THREE.Vector3();
+    dragState.currentWorld = new THREE.Vector3();
+
+    dragState.arrow = new THREE.ArrowHelper(
+        new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 0), 1, 0xffff00
+    );
+    dragState.arrow.visible = false;
+    dragState.arrow.line.material.transparent = true;
+    dragState.arrow.cone.material.transparent = true;
+    dragState.arrow.line.material.opacity = 0.7;
+    dragState.arrow.cone.material.opacity = 0.7;
+    scene3d.add(dragState.arrow);
+
+    const canvas = renderer.domElement;
+    canvas.addEventListener('pointerdown', onDragPointerDown, true);
+    document.addEventListener('pointermove', onDragPointerMove, true);
+    document.addEventListener('pointerup', onDragPointerUp, true);
+}
+
+function updateDragRaycaster(x, y) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    dragState.mousePos.x = ((x - rect.left) / rect.width) * 2 - 1;
+    dragState.mousePos.y = -((y - rect.top) / rect.height) * 2 + 1;
+    dragState.raycaster.setFromCamera(dragState.mousePos, camera);
+}
+
+function recomputeDragTarget() {
+    updateDragRaycaster(dragState.lastClientX, dragState.lastClientY);
+    const hitPoint = dragState.raycaster.ray.origin.clone()
+        .addScaledVector(dragState.raycaster.ray.direction, dragState.grabDistance);
+    dragState.currentWorld.copy(hitPoint);
+}
+
+function findPhysicsBody(obj) {
+    let cur = obj;
+    while (cur) {
+        if (cur.userData.bodyIndex !== undefined) return { type: 'link', index: cur.userData.bodyIndex };
+        cur = cur.parent;
+    }
+    return null;
+}
+
+function onDragPointerDown(evt) {
+    if (evt.button !== 0) return;
+    dragState.lastClientX = evt.clientX;
+    dragState.lastClientY = evt.clientY;
+    updateDragRaycaster(evt.clientX, evt.clientY);
+
+    const intersects = dragState.raycaster.intersectObjects(worldGroup.children, true);
+    dragState.mouseDown = true;
+
+    for (const hit of intersects) {
+        const body = findPhysicsBody(hit.object);
+        if (!body) continue;
+
+        let pxBody = null;
+        if (body.type === 'link') pxBody = links[body.index].link;
+        if (!pxBody) continue;
+
+        dragState.physicsBody = pxBody;
+        dragState.active = true;
+        dragState.grabDistance = hit.distance;
+
+        const hitPoint = dragState.raycaster.ray.origin.clone()
+            .addScaledVector(dragState.raycaster.ray.direction, hit.distance);
+
+        dragState.localHit.copy(hitPoint);
+        hit.object.worldToLocal(dragState.localHit);
+        dragState._hitObject = hit.object;
+
+        dragState.worldHit.copy(hitPoint);
+        dragState.currentWorld.copy(hitPoint);
+        dragState.arrow.position.copy(hitPoint);
+        dragState.arrow.visible = true;
+
+        controls.enabled = false;
+        break;
+    }
+}
+
+function onDragPointerMove(evt) {
+    dragState.lastClientX = evt.clientX;
+    dragState.lastClientY = evt.clientY;
+    if (!dragState.mouseDown || !dragState.active) return;
+    recomputeDragTarget();
+    updateDragArrow();
+}
+
+function onDragPointerUp(evt) {
+    if (evt.button !== 0) return;
+    dragState.mouseDown = false;
+    dragState.active = false;
+    dragState.physicsBody = null;
+    dragState.arrow.visible = false;
+    controls.enabled = true;
+}
+
+function updateDragArrow() {
+    if (!dragState.active || !dragState._hitObject) return;
+    dragState.worldHit.copy(dragState.localHit);
+    dragState._hitObject.localToWorld(dragState.worldHit);
+
+    const dir = dragState.currentWorld.clone().sub(dragState.worldHit);
+    const len = dir.length();
+    if (len > 0.001) {
+        dragState.arrow.position.copy(dragState.worldHit);
+        dragState.arrow.setDirection(dir.normalize());
+        dragState.arrow.setLength(len, Math.min(len * 0.3, 0.3), Math.min(len * 0.15, 0.15));
+        dragState.arrow.visible = true;
+    } else {
+        dragState.arrow.visible = false;
+    }
+}
+
+function applyDragForce() {
+    if (!dragState.active || !dragState.physicsBody) return;
+    recomputeDragTarget();
+    updateDragArrow();
+
+    const displacement = dragState.currentWorld.clone().sub(dragState.worldHit);
+    const pxDisp = threeToPhysX(displacement);
+    const pxHitPt = threeToPhysX(dragState.worldHit);
+
+    let mass = 1.0;
+    try { mass = dragState.physicsBody.getMass(); } catch(e) {}
+
+    const force = new PhysX.PxVec3(
+        pxDisp.x * mass * DRAG_STIFFNESS,
+        pxDisp.y * mass * DRAG_STIFFNESS,
+        pxDisp.z * mass * DRAG_STIFFNESS
+    );
+    const point = new PhysX.PxVec3(pxHitPt.x, pxHitPt.y, pxHitPt.z);
+
+    try {
+        PhysX.PxRigidBodyExt.prototype.addForceAtPos(
+            dragState.physicsBody, force, point
+        );
+    } catch(e) {
+        try { dragState.physicsBody.addForce(force); } catch(e2) {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Update Three.js meshes from PhysX link poses
+// ---------------------------------------------------------------------------
+function updateMeshes() {
+    for (const entry of links) {
+        if (!entry.meshGroup) continue;
+        const pose = entry.link.getGlobalPose();
+        const p = pose.get_p();
+        const q = pose.get_q();
+        entry.meshGroup.position.set(p.get_x(), p.get_y(), p.get_z());
+        entry.meshGroup.quaternion.set(q.get_x(), q.get_y(), q.get_z(), q.get_w());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quaternion / vector math utilities for observation building.
+// ---------------------------------------------------------------------------
+
+function quatRotateVec(q, v) {
+    const [qx, qy, qz, qw] = q;
+    const [vx, vy, vz] = v;
+    const tx = 2 * (qy*vz - qz*vy);
+    const ty = 2 * (qz*vx - qx*vz);
+    const tz = 2 * (qx*vy - qy*vx);
+    return [
+        vx + qw*tx + (qy*tz - qz*ty),
+        vy + qw*ty + (qz*tx - qx*tz),
+        vz + qw*tz + (qx*ty - qy*tx)
+    ];
+}
+
+function quatMul(a, b) {
+    const [ax,ay,az,aw] = a, [bx,by,bz,bw] = b;
+    return [
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+        aw*bw - ax*bx - ay*by - az*bz
+    ];
+}
+
+function quatNorm(q) {
+    const [x,y,z,w] = q;
+    const len = Math.sqrt(x*x + y*y + z*z + w*w) || 1;
+    return [x/len, y/len, z/len, w/len];
+}
+
+function axisAngleToQuat(axis, angle) {
+    const ha = angle * 0.5;
+    const s = Math.sin(ha), c = Math.cos(ha);
+    const len = Math.sqrt(axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]) || 1;
+    return quatNorm([axis[0]/len*s, axis[1]/len*s, axis[2]/len*s, c]);
+}
+
+function expMapToQuat(ex, ey, ez) {
+    const angle = Math.sqrt(ex*ex + ey*ey + ez*ez);
+    if (angle < 1e-5) return [0, 0, 0, 1];
+    return axisAngleToQuat([ex/angle, ey/angle, ez/angle], angle);
+}
+
+function calcHeading(q) {
+    const rotDir = quatRotateVec(q, [1, 0, 0]);
+    return Math.atan2(rotDir[1], rotDir[0]);
+}
+
+function calcHeadingQuatInv(q) {
+    const heading = calcHeading(q);
+    return axisAngleToQuat([0, 0, 1], -heading);
+}
+
+function quatToTanNorm(q) {
+    const tan = quatRotateVec(q, [1, 0, 0]);
+    const norm = quatRotateVec(q, [0, 0, 1]);
+    return [tan[0], tan[1], tan[2], norm[0], norm[1], norm[2]];
+}
+
+// ---------------------------------------------------------------------------
+// Build observation vector (158 dims) - same as index.html
+// ---------------------------------------------------------------------------
+function buildObservation() {
+    const obs = new Float32Array(humanoidData.obs_dim);
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+
+    const rootPose = links[0].link.getGlobalPose();
+    const rpx = rootPose.get_p();
+    const rqx = rootPose.get_q();
+
+    const rootPos = [rpx.get_x(), rpx.get_y(), rpx.get_z()];
+    const rootRot = [rqx.get_x(), rqx.get_y(), rqx.get_z(), rqx.get_w()];
+
+    const rv = links[0].link.getLinearVelocity();
+    const rootVel = [rv.get_x(), rv.get_y(), rv.get_z()];
+    const raw = links[0].link.getAngularVelocity();
+    const rootAngVel = [raw.get_x(), raw.get_y(), raw.get_z()];
+
+    const headingInv = calcHeadingQuatInv(rootRot);
+
+    let idx = 0;
+
+    obs[idx++] = rootPos[2];
+
+    const localRootRot = quatMul(headingInv, rootRot);
+    const rootTanNorm = quatToTanNorm(localRootRot);
+    for (let i = 0; i < 6; i++) obs[idx++] = rootTanNorm[i];
+
+    const localVel = quatRotateVec(headingInv, rootVel);
+    obs[idx++] = localVel[0];
+    obs[idx++] = localVel[1];
+    obs[idx++] = localVel[2];
+
+    const localAngVel = quatRotateVec(headingInv, rootAngVel);
+    obs[idx++] = localAngVel[0];
+    obs[idx++] = localAngVel[1];
+    obs[idx++] = localAngVel[2];
+
+    const dofPositions = new Float32Array(31);
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (childLink) {
+            try {
+                const joint = childLink.getInboundJoint();
+                dofPositions[i] = joint.getJointPosition(axisEnums[dof.physx_axis]);
+            } catch(e) { dofPositions[i] = 0; }
+        }
+    }
+
+    const jointRotQuats = [];
+    for (const kj of humanoidData.kinematicJoints) {
+        let quat;
+        if (kj.type === 'SPHERICAL') {
+            const ex = dofPositions[kj.dof_idx];
+            const ey = dofPositions[kj.dof_idx + 1];
+            const ez = dofPositions[kj.dof_idx + 2];
+            quat = expMapToQuat(ex, ey, ez);
+        } else if (kj.type === 'HINGE') {
+            const angle = dofPositions[kj.dof_idx];
+            quat = axisAngleToQuat(kj.axis, angle);
+        } else {
+            quat = [0, 0, 0, 1];
+        }
+        jointRotQuats.push(quat);
+        const tn = quatToTanNorm(quat);
+        for (let k = 0; k < 6; k++) obs[idx++] = tn[k];
+    }
+
+    for (const dof of humanoidData.dofInfo) {
+        try {
+            const childLink = bodyLinkMap[dof.child_body];
+            if (childLink) {
+                const joint = childLink.getInboundJoint();
+                obs[idx++] = joint.getJointVelocity(axisEnums[dof.physx_axis]);
+            } else { obs[idx++] = 0; }
+        } catch(e) { obs[idx++] = 0; }
+    }
+
+    {
+        const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
+        for (const bid of keyIds) {
+            const linkPose = links[bid].link.getGlobalPose();
+            const lp = linkPose.get_p();
+            const bp = [lp.get_x(), lp.get_y(), lp.get_z()];
+            const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
+            const localRel = quatRotateVec(headingInv, rel);
+            obs[idx++] = localRel[0];
+            obs[idx++] = localRel[1];
+            obs[idx++] = localRel[2];
+        }
+    }
+
+    return obs;
+}
+
+// ---------------------------------------------------------------------------
+// Build task observation vector (15 dims) for HRL physics strike task
+// ASE Strike task obs (15 dims):
+// local_tar_pos(3) + local_tar_rot_tan_norm(6) + local_tar_vel(3) + local_tar_ang_vel(3)
+// ---------------------------------------------------------------------------
+function buildTaskObs() {
+    const taskObs = new Float32Array(15);
+
+    // Get root state
+    const rootPose = links[0].link.getGlobalPose();
+    const rp = rootPose.get_p();
+    const rqx = rootPose.get_q();
+    const rootPos = [rp.get_x(), rp.get_y(), rp.get_z()];
+    const rootRot = [rqx.get_x(), rqx.get_y(), rqx.get_z(), rqx.get_w()];
+    const headingInv = calcHeadingQuatInv(rootRot);
+
+    // Get target state from PhysX
+    const tarPos = getStrikeTargetPos();
+    const tarRot = getStrikeTargetRot();
+    const tarVel = getStrikeTargetVel();
+    const tarAngVel = getStrikeTargetAngVel();
+
+    let idx = 0;
+
+    // [0-2] local_tar_pos: relative to root, absolute Z (ASE convention)
+    const tarRel = [
+        tarPos[0] - rootPos[0],
+        tarPos[1] - rootPos[1],
+        tarPos[2]  // absolute Z height
+    ];
+    const localTarPos = quatRotateVec(headingInv, tarRel);
+    taskObs[idx++] = localTarPos[0];
+    taskObs[idx++] = localTarPos[1];
+    taskObs[idx++] = localTarPos[2];
+
+    // [3-8] local_tar_rot as tan_norm (6 dims)
+    const localTarRot = quatMul(headingInv, tarRot);
+    const tarTanNorm = quatToTanNorm(localTarRot);
+    taskObs[idx++] = tarTanNorm[0];
+    taskObs[idx++] = tarTanNorm[1];
+    taskObs[idx++] = tarTanNorm[2];
+    taskObs[idx++] = tarTanNorm[3];
+    taskObs[idx++] = tarTanNorm[4];
+    taskObs[idx++] = tarTanNorm[5];
+
+    // [9-11] local_tar_vel: target velocity in heading frame
+    const localTarVel = quatRotateVec(headingInv, tarVel);
+    taskObs[idx++] = localTarVel[0];
+    taskObs[idx++] = localTarVel[1];
+    taskObs[idx++] = localTarVel[2];
+
+    // [12-14] local_tar_ang_vel: target angular velocity in heading frame
+    const localTarAngVel = quatRotateVec(headingInv, tarAngVel);
+    taskObs[idx++] = localTarAngVel[0];
+    taskObs[idx++] = localTarAngVel[1];
+    taskObs[idx++] = localTarAngVel[2];
+
+    // Debug: log task obs every 60 frames
+    if (!window._taskObsLogCount) window._taskObsLogCount = 0;
+    if (++window._taskObsLogCount % 60 === 0) {
+        const tarDist = Math.sqrt(tarRel[0]*tarRel[0] + tarRel[1]*tarRel[1] + tarRel[2]*tarRel[2]);
+        console.log('taskObs | tarRel(world):', tarRel.map(v=>v.toFixed(2)),
+            '| localTarPos:', [taskObs[0],taskObs[1],taskObs[2]].map(v=>v.toFixed(2)),
+            '| dist:', tarDist.toFixed(2),
+            '| tarVel:', [taskObs[3],taskObs[4],taskObs[5]].map(v=>v.toFixed(2)));
+    }
+
+    return taskObs;
+}
+
+// ---------------------------------------------------------------------------
+// Random latent vector (unit sphere) - for ASE mode
+// ---------------------------------------------------------------------------
+let latentTarget = null;
+let latentBlendRate = 0.05;
+
+function randomLatent() {
+    const dim = humanoidData.latent_dim || 64;
+    latentVec = new Float32Array(dim);
+    let norm = 0;
+    for (let i = 0; i < dim; i++) { latentVec[i] = gaussianRandom(); norm += latentVec[i] * latentVec[i]; }
+    norm = Math.sqrt(norm);
+    for (let i = 0; i < dim; i++) latentVec[i] /= norm;
+    latentTarget = new Float32Array(latentVec);
+    console.log('Random latent sampled');
+}
+
+function newLatentTarget() {
+    const dim = humanoidData.latent_dim || 64;
+    latentTarget = new Float32Array(dim);
+    let norm = 0;
+    for (let i = 0; i < dim; i++) { latentTarget[i] = gaussianRandom(); norm += latentTarget[i] * latentTarget[i]; }
+    norm = Math.sqrt(norm);
+    for (let i = 0; i < dim; i++) latentTarget[i] /= norm;
+}
+
+function slerpLatent() {
+    if (!latentTarget || !latentVec) return;
+    const dim = latentVec.length;
+    let norm = 0;
+    for (let i = 0; i < dim; i++) {
+        latentVec[i] += latentBlendRate * (latentTarget[i] - latentVec[i]);
+        norm += latentVec[i] * latentVec[i];
+    }
+    norm = Math.sqrt(norm);
+    if (norm > 1e-8) for (let i = 0; i < dim; i++) latentVec[i] /= norm;
+}
+
+// ---------------------------------------------------------------------------
+// ONNX inference - split model (HLC + LLC)
+// ---------------------------------------------------------------------------
+// Both modes share the same LLC. In HRL mode, the HLC produces the latent z
+// from task observations. In ASE mode, z comes from the manual latent vector.
+async function runPolicyHRL(obs, taskObs) {
+    if (!onnxSessionHLC) return null;
+    // HLC: obs + task_obs → z
+    const obsTensor = new ort.Tensor('float32', obs, [1, humanoidData.obs_dim]);
+    const taskObsTensor = new ort.Tensor('float32', taskObs, [1, 15]);
+    const hlcResult = await onnxSessionHLC.run({ obs: obsTensor, task_obs: taskObsTensor });
+    const z = hlcResult.z.data;
+    // LLC: obs + z → action
+    const latentTensor = new ort.Tensor('float32', z, [1, humanoidData.latent_dim || 64]);
+    const llcResult = await onnxSessionLLC.run({ obs: obsTensor, latent: latentTensor });
+    return llcResult.action.data;
+}
+
+async function runPolicyASE(obs) {
+    // LLC: obs + manual latent → action
+    const obsTensor = new ort.Tensor('float32', obs, [1, humanoidData.obs_dim]);
+    const latentTensor = new ort.Tensor('float32', latentVec, [1, humanoidData.latent_dim || 64]);
+    const results = await onnxSessionLLC.run({ obs: obsTensor, latent: latentTensor });
+    return results.action.data;
+}
+
+// ---------------------------------------------------------------------------
+// Apply actions as PD drive targets
+// ---------------------------------------------------------------------------
+function applyActions(action) {
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+
+    const aLow = humanoidData.action_low;
+    const aHigh = humanoidData.action_high;
+
+    let appliedCount = 0;
+    let clippedMin = Infinity, clippedMax = -Infinity;
+    let rawMin = Infinity, rawMax = -Infinity;
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (!childLink) { continue; }
+        try {
+            const joint = childLink.getInboundJoint();
+            if (!joint) continue;
+            let a = action[i];
+            rawMin = Math.min(rawMin, a);
+            rawMax = Math.max(rawMax, a);
+            if (aLow && aHigh) {
+                a = Math.max(aLow[i], Math.min(aHigh[i], a));
+            }
+            clippedMin = Math.min(clippedMin, a);
+            clippedMax = Math.max(clippedMax, a);
+            joint.setDriveTarget(axisEnums[dof.physx_axis], a);
+            appliedCount++;
+        } catch(e) {
+            if (!window._applyWarnLogged) {
+                console.warn('setDriveTarget failed for', dof.axis_name, ':', e.message);
+                window._applyWarnLogged = true;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reset
+// ---------------------------------------------------------------------------
+let _postResetHooks = [];
+
+function resetHumanoid() {
+    prevAction = null;
+    dragState.active = false;
+    dragState.mouseDown = false;
+    dragState.physicsBody = null;
+    if (dragState.arrow) dragState.arrow.visible = false;
+    controls.enabled = true;
+
+    pxScene.removeArticulation(articulation);
+    for (const entry of links) {
+        if (entry.meshGroup) worldGroup.remove(entry.meshGroup);
+    }
+    links = [];
+    buildArticulation();
+    // Recreate meshes
+    for (let bi = 0; bi < humanoidData.bodies.length; bi++) {
+        const body = humanoidData.bodies[bi];
+        const group = new THREE.Group();
+        const color = BODY_COLORS[body.name] || 0x888888;
+        for (const geom of body.geoms) {
+            const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2 });
+            let mesh = null;
+            if (geom.type === 'sphere') {
+                mesh = new THREE.Mesh(new THREE.SphereGeometry(geom.radius, 16, 12), mat);
+                const lp = geom.pos;
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+                const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+                const dir = new THREE.Vector3().subVectors(p1, p0);
+                const len = dir.length();
+                mesh = new THREE.Mesh(new THREE.CapsuleGeometry(geom.radius, len, 8, 12), mat);
+                mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+            } else if (geom.type === 'box') {
+                const he = geom.halfExtents;
+                mesh = new THREE.Mesh(new THREE.BoxGeometry(he[0]*2, he[1]*2, he[2]*2), mat);
+                const lp = geom.pos;
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'cylinder') {
+                const r = geom.radius;
+                if (geom.fromto) {
+                    const ft = geom.fromto;
+                    const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+                    const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+                    const dir = new THREE.Vector3().subVectors(p1, p0);
+                    const len = Math.max(dir.length(), 0.01);
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 16), mat);
+                    mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                    if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                } else {
+                    const hh = geom.halfHeight || 0.015;
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, hh*2, 16), mat);
+                    const lp = geom.pos || [0,0,0];
+                    mesh.position.set(lp[0], lp[1], lp[2]);
+                }
+            }
+            if (mesh) {
+                mesh.castShadow = true;
+                mesh.userData.bodyIndex = bi;
+                group.add(mesh);
+            }
+        }
+        worldGroup.add(group);
+        links[bi].meshGroup = group;
+    }
+    // Reset strike target
+    resetStrikeTarget();
+    // Run post-reset hooks
+    for (const hook of _postResetHooks) hook();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+async function mainLoop(timestamp) {
+    if (!running) return;
+
+    frameCount++;
+    if (timestamp - lastFpsTime > 1000) {
+        document.getElementById('fpsDisplay').textContent = `FPS: ${frameCount}`;
+        if (window._guiStats) window._guiStats.fps = frameCount;
+        frameCount = 0;
+        lastFpsTime = timestamp;
+    }
+
+    if (!window._lastSimTimestamp) window._lastSimTimestamp = timestamp;
+    const realDT = Math.min((timestamp - window._lastSimTimestamp) / 1000, 0.1);
+    window._lastSimTimestamp = timestamp;
+
+    if (!window._simAccum) window._simAccum = 0;
+    window._simAccum += realDT * timeScale;
+
+    const maxSubstepsPerFrame = 8;
+    let stepsThisFrame = 0;
+    while (window._simAccum >= DT && stepsThisFrame < maxSubstepsPerFrame) {
+        window._simAccum -= DT;
+        stepsThisFrame++;
+
+        if (!window._physStepCount) window._physStepCount = 0;
+        window._physStepCount++;
+
+        if (window._physStepCount >= numSubsteps) {
+            window._physStepCount = 0;
+
+            // Run policy (mode-dependent)
+            if (policyEnabled) {
+                try {
+                    const obs = buildObservation();
+                    if (currentMode === 'hrl') {
+                        const taskObs = buildTaskObs();
+                        currentAction = await runPolicyHRL(obs, taskObs);
+                    } else {
+                        slerpLatent();
+                        currentAction = await runPolicyASE(obs);
+                    }
+                    if (currentAction) applyActions(currentAction);
+                } catch (e) {
+                    if (!window._policyErrCount) window._policyErrCount = 0;
+                    if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
+                    if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+                }
+            } else {
+                applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
+            }
+        }
+
+        applyDragForce();
+        pxScene.simulate(DT);
+        pxScene.fetchResults(true);
+        if (restoreGroundAfterStep) { restoreGround(); restoreGroundAfterStep = false; }
+    }
+
+    // Update strike target (periodic repositioning, HRL mode only)
+    if (currentMode === 'hrl') updateStrikeTarget();
+
+    // Auto-reset if physics explodes
+    try {
+        const rz = links[0].link.getGlobalPose().get_p().get_z();
+        if (resetGraceFrames > 0) resetGraceFrames--;
+        else if (isNaN(rz) || Math.abs(rz) > 50) { resetHumanoid(); resetGraceFrames = RESET_GRACE; }
+    } catch(e) {}
+
+    // Camera tracking
+    {
+        const rp = links[0].link.getGlobalPose().get_p();
+        controls.target.lerp(new THREE.Vector3(rp.get_x(), Math.max(rp.get_z(), 0.5), -rp.get_y()), 0.05);
+    }
+
+    updateMeshes();
+    updateDebugInfo();
+    controls.update();
+    renderer.render(scene3d, camera);
+    requestAnimationFrame(mainLoop);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+async function init() {
+    try {
+        await Promise.all([loadOnnxModel(), initPhysX()]);
+        await loadHumanoidData();
+
+        setStatus('Building humanoid...');
+        buildArticulation();
+
+        initThreeJS();
+        createStrikeTargetPhysX();
+        createStrikeTargetMesh();
+
+        // Initialize latent vector for ASE mode
+        randomLatent();
+
+        // Initialize strike target
+        resetStrikeTarget();
+
+        document.getElementById('overlay').style.display = 'none';
+
+        // Build lil-gui panel
+        const gui = new GUI({ title: 'MimicKit' });
+
+        // Mode toggle
+        const modeParams = { mode: 'HRL Strike' };
+        const modeOptions = onnxSessionHLC ? ['HRL Strike', 'ASE Latent'] : ['ASE Latent'];
+        gui.add(modeParams, 'mode', modeOptions).name('Mode').onChange(v => {
+            currentMode = v === 'HRL Strike' ? 'hrl' : 'ase';
+            document.querySelector('#hud .title').textContent =
+                currentMode === 'hrl' ? 'HRL Strike Task - Sword & Shield' : 'ASE Latent Mode - Sword & Shield';
+            // Show/hide strike target in ASE mode
+            if (strikeTargetMesh) strikeTargetMesh.visible = (currentMode === 'hrl');
+            console.log('Mode:', currentMode);
+        });
+
+        // Reset button (resets humanoid and target)
+        gui.add({ reset: () => { resetHumanoid(); if (currentMode === 'ase') randomLatent(); } }, 'reset').name('Reset');
+
+        // ASE mode controls
+        const aseFolder = gui.addFolder('ASE Latent');
+        aseFolder.add({ randomSkill: () => { randomLatent(); resetHumanoid(); } }, 'randomSkill').name('Random Skill + Reset');
+        aseFolder.add({ newTarget: newLatentTarget }, 'newTarget').name('New Latent Target');
+
+        // HRL mode controls
+        const hrlFolder = gui.addFolder('HRL Strike');
+        hrlFolder.add({ newTarget: resetStrikeTarget }, 'newTarget').name('New Target');
+
+        // Simulation folder
+        const simFolder = gui.addFolder('Simulation');
+        const simParams = {
+            drives: drivesEnabled,
+            policy: policyEnabled,
+            selfCollision: selfCollisionEnabled,
+            gravity: gravityEnabled,
+            gravityStrength: -9.81,
+            substeps: numSubsteps,
+        };
+        simFolder.add(simParams, 'drives').name('Active Drives').onChange(v => { drivesEnabled = v; applyDriveParams(); });
+        simFolder.add(simParams, 'policy').name('NN Policy').onChange(v => { policyEnabled = v; });
+        simFolder.add(simParams, 'selfCollision').name('Self-Collision').onChange(v => { setSelfCollision(v); });
+        simFolder.add(simParams, 'gravity').name('Gravity').onChange(v => { setGravity(v); });
+        simFolder.add(simParams, 'gravityStrength', -20, 0, 0.1).name('Gravity Strength').onChange(v => {
+            pxScene.setGravity(new PhysX.PxVec3(0, 0, v));
+        });
+        simFolder.add(simParams, 'substeps', 1, 16, 1).name('Substeps').onChange(v => { numSubsteps = v; });
+
+        simFolder.close();
+
+        const stats = { root_z: 0, root_speed: 0, max_dof_vel: 0, fps: 0 };
+        window._guiStats = stats;
+
+        // Y-axis constraint via D6 joint
+        let yConstraintJoint = null;
+        let yConstraintActor = null;
+        function enableYConstraint() {
+            if (yConstraintJoint) return;
+            const rootPose = links[0].link.getGlobalPose();
+            const rp = rootPose.get_p();
+            const anchorPose = new PhysX.PxTransform(
+                new PhysX.PxVec3(rp.get_x(), 0, rp.get_z()),
+                new PhysX.PxQuat(0, 0, 0, 1)
+            );
+            yConstraintActor = physics.createRigidStatic(anchorPose);
+            pxScene.addActor(yConstraintActor);
+
+            const localFrame0 = new PhysX.PxTransform(new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1));
+            const localFrame1 = new PhysX.PxTransform(
+                new PhysX.PxVec3(0, rp.get_y(), 0),
+                new PhysX.PxQuat(0, 0, 0, 1)
+            );
+            yConstraintJoint = PhysX.PxTopLevelFunctions.prototype.D6JointCreate(
+                physics, yConstraintActor, localFrame0, links[0].link, localFrame1
+            );
+            if (yConstraintJoint) {
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eX, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eY, PhysX.PxD6MotionEnum.eLOCKED);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eZ, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eTWIST, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eSWING1, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eSWING2, PhysX.PxD6MotionEnum.eFREE);
+                console.log('Y constraint enabled via D6 joint');
+            } else {
+                console.error('Failed to create D6 joint for Y constraint');
+            }
+        }
+        function disableYConstraint() {
+            if (yConstraintJoint) { yConstraintJoint.release(); yConstraintJoint = null; }
+            if (yConstraintActor) { pxScene.removeActor(yConstraintActor); yConstraintActor.release(); yConstraintActor = null; }
+            console.log('Y constraint disabled');
+        }
+        simParams.lockY = false;
+        simFolder.add(simParams, 'lockY').name('Lock Y Axis').onChange(v => {
+            if (v) enableYConstraint(); else disableYConstraint();
+        });
+
+        // Register post-reset hooks
+        _postResetHooks.push(() => {
+            setSelfCollision(simParams.selfCollision);
+            setGravity(simParams.gravity);
+            if (simParams.gravity) pxScene.setGravity(new PhysX.PxVec3(0, 0, simParams.gravityStrength));
+            applyDriveParams();
+            yConstraintJoint = null; yConstraintActor = null;
+            if (simParams.lockY) enableYConstraint();
+        });
+
+        running = true;
+        lastFpsTime = performance.now();
+        requestAnimationFrame(mainLoop);
+        console.log('Demo running!');
+    } catch (err) {
+        setStatus('Error: ' + err.message);
+        console.error(err);
+    }
+}
+
+init();
+</script>
+</body>
+</html>
