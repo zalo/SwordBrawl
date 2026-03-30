@@ -2,11 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>SwordBrawl</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; touch-action: manipulation; }
 canvas { display: block; }
 #overlay {
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -357,9 +357,19 @@ function updateLabels() {
     label.div.textContent = info.name;
     label.div.style.color = info.color || '#fff';
 
-    // Root is in Z-up PhysX coords; worldGroup rotation handles Z-up → Y-up
-    const px = poses[0], py = poses[1], pz = poses[2];
-    const worldPos = new THREE.Vector3(px, py, pz + 0.7);
+    // Interpolate root position (same as mesh interpolation)
+    const prev = playerPosesPrev[pid];
+    const lastTime = playerPosesTime[pid] || performance.now();
+    const t = Math.min((performance.now() - lastTime) / 50, 1.0);
+    let rx, ry, rz;
+    if (prev && prev.length >= 7) {
+      rx = prev[0] + (poses[0] - prev[0]) * t;
+      ry = prev[1] + (poses[1] - prev[1]) * t;
+      rz = prev[2] + (poses[2] - prev[2]) * t;
+    } else {
+      rx = poses[0]; ry = poses[1]; rz = poses[2];
+    }
+    const worldPos = new THREE.Vector3(rx, ry, rz + 0.7);
     worldGroup.localToWorld(worldPos);
 
     const screenPos = worldPos.project(camera);
