@@ -660,7 +660,7 @@ class PlayerHumanoid {
     art.setSolverIterationCounts(4, 0);
     if (typeof art.setSleepThreshold === 'function') art.setSleepThreshold(5e-5);
     if (typeof art.setStabilizationThreshold === 'function') art.setStabilizationThreshold(1e-5);
-    art.setArticulationFlag(px.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, false);
+    art.setArticulationFlag(px.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true);
 
     this.articulation = art;
 
@@ -1399,12 +1399,17 @@ class PartyServer {
               let action;
 
               if (pid === this.CPU_PLAYER_ID && this.sessionHLCStrike) {
-                // CPU player: strike the nearest human player
+                // CPU player: strike the nearest human player, fall back to steering
                 const target = this._findNearestHumanPlayer(player);
                 if (target) {
                   const strikeObs = player.buildStrikeTaskObs(target);
                   action = runStrikeInference(
                     this.sessionHLCStrike, this.sessionLLC, obs, strikeObs, this.humanoidData);
+                } else {
+                  // No human target — use steering to wander
+                  const taskObs = player.buildTaskObs();
+                  action = runInferenceForPlayer(
+                    this.sessionHLC, this.sessionLLC, obs, taskObs, this.humanoidData, player);
                 }
               } else {
                 const taskObs = player.buildTaskObs();
