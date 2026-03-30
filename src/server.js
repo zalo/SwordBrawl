@@ -1434,11 +1434,16 @@ class PartyServer {
       this.pxScene.fetchResults(true);
     }
 
-    // Check for resets
+    // Check for resets (3 second delay)
     for (const pid of playerIds) {
       const player = this.players[pid];
       if (player && player.needsReset()) {
-        this._resetPlayer(pid);
+        if (!player._respawnPending) {
+          player._respawnPending = true;
+          setTimeout(() => {
+            if (this.players[pid]) this._resetPlayer(pid);
+          }, 3000);
+        }
       }
     }
 

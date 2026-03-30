@@ -685,13 +685,32 @@ function findNearestPlayerId() {
 function updateThirdPersonCamera() {
   if (!myPlayerId || !playerPoses[myPlayerId]) return;
   const poses = playerPoses[myPlayerId];
-  const px2 = poses[0], py2 = poses[1], pz2 = poses[2];
+  const prev = playerPosesPrev[myPlayerId];
+  const lastTime = playerPosesTime[myPlayerId] || performance.now();
+  const t = Math.min((performance.now() - lastTime) / 50, 1.0);
+  let px2, py2, pz2;
+  if (prev && prev.length >= 3) {
+    px2 = prev[0] + (poses[0] - prev[0]) * t;
+    py2 = prev[1] + (poses[1] - prev[1]) * t;
+    pz2 = prev[2] + (poses[2] - prev[2]) * t;
+  } else {
+    px2 = poses[0]; py2 = poses[1]; pz2 = poses[2];
+  }
 
-  // Lock-on: rotate yaw towards target
+  // Lock-on: rotate yaw towards target (also interpolated)
   if (lockOnEnabled && lockOnTargetId && playerPoses[lockOnTargetId]) {
-    const tp = playerPoses[lockOnTargetId];
-    // Direction from me to target in PhysX XY plane
-    const dx = tp[0] - px2, dy = tp[1] - py2;
+    const tpCurr = playerPoses[lockOnTargetId];
+    const tpPrev = playerPosesPrev[lockOnTargetId];
+    const tpTime = playerPosesTime[lockOnTargetId] || performance.now();
+    const tt = Math.min((performance.now() - tpTime) / 50, 1.0);
+    let tpx, tpy;
+    if (tpPrev && tpPrev.length >= 2) {
+      tpx = tpPrev[0] + (tpCurr[0] - tpPrev[0]) * tt;
+      tpy = tpPrev[1] + (tpCurr[1] - tpPrev[1]) * tt;
+    } else {
+      tpx = tpCurr[0]; tpy = tpCurr[1];
+    }
+    const dx = tpx - px2, dy = tpy - py2;
     // Camera yaw = direction character faces (due to negated faceDir)
     const targetYaw = Math.atan2(dy, dx) + Math.PI;
     // Smoothly interpolate yaw (handle wrap-around)
