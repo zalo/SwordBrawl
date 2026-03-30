@@ -665,14 +665,19 @@ class PlayerHumanoid {
     this.articulation = art;
 
     // Spawn offset: spread players in a line
-    const spawnX = ((spawnIndex % MAX_PLAYERS) - MAX_PLAYERS/2) * 3;
+    // Random spawn within a radius
+    const spawnRadius = 8;
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.sqrt(Math.random()) * spawnRadius;
+    const spawnX = Math.cos(angle) * dist;
+    const spawnY = Math.sin(angle) * dist;
 
     const bodyLinkMap = {};
     for (const body of humanoidData.bodies) {
       const wp = body.pos;
       const zOff = humanoidData.tpose_pelvis_z || humanoidData.pelvis_z;
       const pose = new px.PxTransform(
-        new px.PxVec3(wp[0] + spawnX, wp[1], wp[2] + zOff),
+        new px.PxVec3(wp[0] + spawnX, wp[1] + spawnY, wp[2] + zOff),
         new px.PxQuat(0, 0, 0, 1)
       );
 
@@ -859,7 +864,7 @@ class PlayerHumanoid {
     const initDof = humanoidData.init_dof_pos;
 
     this.articulation.setRootGlobalPose(new px.PxTransform(
-      new px.PxVec3(rp[0] + spawnX, rp[1], rp[2]),
+      new px.PxVec3(rp[0] + spawnX, rp[1] + spawnY, rp[2]),
       new px.PxQuat(rq[0], rq[1], rq[2], rq[3])), true);
 
     const bodyLinkMap = {};
@@ -977,7 +982,7 @@ class PlayerHumanoid {
     const headingInv = calcHeadingQuatInv(rootRot);
 
     const localTarDir = quatRotateVec(headingInv, [this.moveDir[0], this.moveDir[1], 0]);
-    const localFaceDir = quatRotateVec(headingInv, [this.faceDir[0], this.faceDir[1], 0]);
+    const localFaceDir = quatRotateVec(headingInv, [-this.faceDir[0], -this.faceDir[1], 0]);
 
     taskObs[0] = localTarDir[0]; taskObs[1] = localTarDir[1];
     taskObs[2] = this.speed;
@@ -1026,6 +1031,8 @@ class PlayerHumanoid {
     try {
       const rz = this.links[0].link.getGlobalPose().get_p().get_z();
       if (isNaN(rz) || Math.abs(rz) > 50) return true;
+      // Respawn if fallen (pelvis Z below 0.4)
+      if (rz < 0.4) return true;
     } catch(e) { return true; }
     return false;
   }
