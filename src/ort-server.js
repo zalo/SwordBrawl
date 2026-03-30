@@ -26,7 +26,8 @@ if (typeof performance === 'undefined') {
 }
 
 import ortFactory from '../assets/onnx/ort-wasm-simd-threaded.mjs';
-import ortWasm from '../assets/onnx/ort-wasm-simd-threaded.wasm';
+// ORT WASM is NOT imported statically (12MB exceeds CF Workers bundle limit).
+// Instead, we fetch it at runtime from our static file server and compile it.
 
 // ORT data type enum values (from onnxruntime C API)
 const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT = 1;
@@ -39,15 +40,24 @@ let _module = null;
 /**
  * Initialize the ONNX Runtime WASM module.
  * Must be called once before any other operations.
+ * @param {string} wasmUrl - URL to fetch the ORT WASM binary from
  * @returns {Promise<object>} The Emscripten module instance
  */
-export async function initOrt() {
+export async function initOrt(wasmUrl) {
   if (_module) return _module;
+
+  // Fetch and compile the WASM module at runtime (too large to bundle statically)
+  console.log('Fetching ORT WASM from:', wasmUrl);
+  const wasmResp = await fetch(wasmUrl);
+  const wasmBinary = new Uint8Array(await wasmResp.arrayBuffer());
+  console.log('ORT WASM fetched:', wasmBinary.byteLength, 'bytes, compiling...');
+  const wasmModule = await WebAssembly.compile(wasmBinary);
+  console.log('ORT WASM compiled');
 
   _module = await ortFactory({
     numThreads: 1,
     instantiateWasm: (imports, callback) => {
-      const instance = new WebAssembly.Instance(ortWasm, imports);
+      const instance = new WebAssembly.Instance(wasmModule, imports);
       callback(instance);
       return instance.exports;
     },

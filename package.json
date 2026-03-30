@@ -8,7 +8,8 @@
   },
   "dependencies": {
     "onnxruntime-web": "^1.21.0",
-    "partysocket": "^1.1.4"
+    "partysocket": "^1.1.4",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "partykit": "^0.0.115",
