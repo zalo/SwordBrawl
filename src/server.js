@@ -853,10 +853,10 @@ class PlayerHumanoid {
     }
 
     pxScene.addArticulation(art);
-    this._applyInitPose(px, humanoidData, spawnX);
+    this._applyInitPose(px, humanoidData, spawnX, spawnY);
   }
 
-  _applyInitPose(px, humanoidData, spawnX) {
+  _applyInitPose(px, humanoidData, spawnX, spawnY) {
     if (!humanoidData.init_root_pos || !humanoidData.init_dof_pos) return;
 
     const rp = humanoidData.init_root_pos;
