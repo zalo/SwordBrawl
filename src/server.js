@@ -665,7 +665,7 @@ class PlayerHumanoid {
     this.articulation = art;
 
     // Spawn offset: spread players in a line
-    const spawnX = (spawnIndex - MAX_PLAYERS/2) * 3;
+    const spawnX = ((spawnIndex % MAX_PLAYERS) - MAX_PLAYERS/2) * 3;
 
     const bodyLinkMap = {};
     for (const body of humanoidData.bodies) {
@@ -1039,7 +1039,7 @@ class PlayerHumanoid {
 // ONNX inference helper (sequential per player, batching would require
 // dynamic batch support which many exported models don't have)
 // ---------------------------------------------------------------------------
-async function runInferenceForPlayer(sessionHLC, sessionLLC, obs, taskObs, humanoidData, player) {
+function runInferenceForPlayer(sessionHLC, sessionLLC, obs, taskObs, humanoidData, player) {
   const obsDim = humanoidData.obs_dim;
   const latentDim = humanoidData.latent_dim || 64;
 
@@ -1051,19 +1051,19 @@ async function runInferenceForPlayer(sessionHLC, sessionLLC, obs, taskObs, human
   else if (player.actionJump) actionLatent = ACTION_LATENTS.jump;
 
   if (actionLatent) {
-    const llcResult = await runSession(sessionLLC, {
+    const llcResult = runSession(sessionLLC, {
       obs: { data: obs, dims: [1, obsDim] },
       latent: { data: actionLatent, dims: [1, latentDim] },
     });
     return llcResult.action;
   } else {
     if (!sessionHLC) return null;
-    const hlcResult = await runSession(sessionHLC, {
+    const hlcResult = runSession(sessionHLC, {
       obs: { data: obs, dims: [1, obsDim] },
       task_obs: { data: taskObs, dims: [1, 5] },
     });
     const z = hlcResult.z;
-    const llcResult = await runSession(sessionLLC, {
+    const llcResult = runSession(sessionLLC, {
       obs: { data: obs, dims: [1, obsDim] },
       latent: { data: z, dims: [1, latentDim] },
     });
@@ -1151,14 +1151,28 @@ class PartyServer {
     console.log('PhysX initialized');
 
     // Load ONNX models via our custom ORT wrapper (bypasses ort npm)
-    await initOrt();
-    console.log('ORT WASM module ready');
+    try {
+      await initOrt();
+      console.log('ORT WASM module ready');
+    } catch(e) {
+      console.error('ORT init failed:', e);
+    }
 
     // Fetch ONNX models from our own static file serving
-    const baseUrl = `https://${this.room.env?.PARTYKIT_HOST || 'swordbrawl.zalo.partykit.dev'}`;
+    // In dev: PARTYKIT_HOST = 127.0.0.1:PORT, in prod: swordbrawl.zalo.partykit.dev
+    const pkHost = this.room.env?.PARTYKIT_HOST || 'localhost:1999';
+    const pkProto = pkHost.startsWith('localhost') || pkHost.startsWith('127.') ? 'http' : 'https';
+    const baseUrl = `${pkProto}://${pkHost}`;
+    console.log('Fetching ONNX models from:', baseUrl);
 
-    const llcResp = await fetch(`${baseUrl}/llc_sword_shield.onnx`);
-    const llcBuf = await llcResp.arrayBuffer();
+    let llcBuf;
+    try {
+      const llcResp = await fetch(`${baseUrl}/llc_sword_shield.onnx`);
+      llcBuf = await llcResp.arrayBuffer();
+      console.log('LLC fetched:', llcBuf.byteLength, 'bytes');
+    } catch(e) {
+      console.error('LLC fetch failed:', e);
+    }
 
     // Extract metadata from LLC binary (before creating session)
     const meta = extractOnnxMetadata(llcBuf);
@@ -1188,15 +1202,24 @@ class PartyServer {
       }
     }
 
-    this.sessionLLC = await createSession(new Uint8Array(llcBuf));
-    console.log('LLC session created');
+    try {
+      this.sessionLLC = await createSession(new Uint8Array(llcBuf));
+      console.log('LLC session created');
+    } catch(e) {
+      console.error('LLC session creation failed:', e);
+    }
 
-    const hlcResp = await fetch(`${baseUrl}/hlc_steering_v2.onnx`);
-    const hlcBuf = await hlcResp.arrayBuffer();
-    this.sessionHLC = await createSession(new Uint8Array(hlcBuf));
-    console.log('HLC session created');
+    try {
+      const hlcResp = await fetch(`${baseUrl}/hlc_steering_v2.onnx`);
+      const hlcBuf = await hlcResp.arrayBuffer();
+      console.log('HLC fetched:', hlcBuf.byteLength, 'bytes');
+      this.sessionHLC = await createSession(new Uint8Array(hlcBuf));
+      console.log('HLC session created');
+    } catch(e) {
+      console.error('HLC session creation failed:', e);
+    }
 
-    // Start tick loop
+    // Start tick loop (all inference is synchronous WASM calls)
     this.lastPhysTime = Date.now();
     this.interval = setInterval(() => this._tick(), 1000 / TICK_HZ);
 
@@ -1230,26 +1253,22 @@ class PartyServer {
         if (player.physStepCount >= NUM_SUBSTEPS) {
           player.physStepCount = 0;
 
-          // Run inference (async but we don't await in the tight loop -
-          // we'll run it and apply on next step)
           if (this.sessionLLC) {
             try {
               const obs = player.buildObservation(this.humanoidData);
               const taskObs = player.buildTaskObs();
-              runInferenceForPlayer(this.sessionHLC, this.sessionLLC, obs, taskObs, this.humanoidData, player)
-                .then(action => {
-                  if (action) {
-                    player.currentAction = action;
-                    player.applyActions(action, this.humanoidData);
-                  }
-                })
-                .catch(e => {});
-            } catch(e) {}
-          }
-
-          // Apply last known action as fallback
-          if (player.currentAction) {
-            player.applyActions(player.currentAction, this.humanoidData);
+              const action = runInferenceForPlayer(
+                this.sessionHLC, this.sessionLLC, obs, taskObs, this.humanoidData, player);
+              if (action) {
+                player.currentAction = action;
+                player.applyActions(action, this.humanoidData);
+              }
+            } catch(e) {
+              if (!this._infErrLogged) { this._infErrLogged = true; console.error('Inference error:', e); }
+              if (player.currentAction) {
+                player.applyActions(player.currentAction, this.humanoidData);
+              }
+            }
           }
         }
       }

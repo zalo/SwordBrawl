@@ -143,8 +143,9 @@ import PartySocket from 'partysocket';
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const PARTYKIT_HOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'localhost:1999'
+const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+const PARTYKIT_HOST = isLocal
+  ? window.location.host   // use whatever port the dev server is on
   : 'swordbrawl.zalo.partykit.dev';
 
 const BODY_COLORS = {
@@ -746,7 +747,7 @@ function mainLoop(timestamp) {
 // Connect
 // ---------------------------------------------------------------------------
 function connect() {
-  const protocol = PARTYKIT_HOST.startsWith('localhost') ? 'ws' : 'wss';
+  const protocol = isLocal ? 'ws' : 'wss';
   const wsUrl = `${protocol}://${PARTYKIT_HOST}/party/swordbrawl`;
 
   conn = new WebSocket(wsUrl);

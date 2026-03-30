@@ -10,14 +10,29 @@
  *  - No dynamic import() calls
  */
 
+// Polyfill performance for Cloudflare Workers
+// Emscripten uses performance.timeOrigin + performance.now() and converts to BigInt
+if (typeof performance === 'undefined') {
+  const _t0 = Date.now();
+  globalThis.performance = { now: () => Date.now() - _t0, timeOrigin: _t0 };
+} else {
+  if (typeof performance.now !== 'function') {
+    const _t0 = Date.now();
+    performance.now = () => Date.now() - _t0;
+  }
+  if (typeof performance.timeOrigin !== 'number' || isNaN(performance.timeOrigin)) {
+    performance.timeOrigin = Date.now();
+  }
+}
+
 import ortFactory from '../assets/onnx/ort-wasm-simd-threaded.mjs';
 import ortWasm from '../assets/onnx/ort-wasm-simd-threaded.wasm';
 
 // ORT data type enum values (from onnxruntime C API)
 const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT = 1;
 
-// Data location enum
-const DATA_LOCATION_CPU = 0;
+// Data location enum (0=none, 1=cpu, 2=cpu-pinned, 3=texture, 4=gpu-buffer, 5=ml-tensor)
+const DATA_LOCATION_CPU = 1;
 
 let _module = null;
 
@@ -63,7 +78,7 @@ function allocString(mod, str) {
  * @param {ArrayBuffer|Uint8Array} modelData - The ONNX model bytes
  * @returns {object} Session object with handle and metadata
  */
-export async function createSession(modelData) {
+export function createSession(modelData) {
   const mod = _module;
   if (!mod) throw new Error('ORT not initialized');
 
@@ -84,7 +99,7 @@ export async function createSession(modelData) {
   // Create session
   let sessionHandle;
   try {
-    sessionHandle = await mod._OrtCreateSession(dataPtr, data.byteLength, optionsHandle);
+    sessionHandle = mod._OrtCreateSession(dataPtr, data.byteLength, optionsHandle);
   } finally {
     mod._OrtReleaseSessionOptions(optionsHandle);
     mod._free(dataPtr);
@@ -148,7 +163,7 @@ export async function createSession(modelData) {
  * @param {Record<string, { data: Float32Array, dims: number[] }>} feeds - Input tensors
  * @returns {Record<string, Float32Array>} Output tensor data
  */
-export async function runSession(session, feeds) {
+export function runSession(session, feeds) {
   const mod = _module;
   if (!mod) throw new Error('ORT not initialized');
 
@@ -200,7 +215,18 @@ export async function runSession(session, feeds) {
         dims.length,
         DATA_LOCATION_CPU,
       );
-      if (tensorHandle === 0) throw new Error(`Failed to create input tensor: ${name}`);
+      if (tensorHandle === 0) {
+        // Check ORT error
+        const errStack = mod.stackSave();
+        const errCodePtr = mod.stackAlloc(4);
+        const errMsgPtr = mod.stackAlloc(4);
+        mod._OrtGetLastError(errCodePtr, errMsgPtr);
+        const errCode = mod.getValue(errCodePtr, 'i32');
+        const errMsgOffset = mod.getValue(errMsgPtr, '*');
+        const errMsg = errMsgOffset ? mod.UTF8ToString(errMsgOffset) : 'unknown';
+        mod.stackRestore(errStack);
+        throw new Error(`Failed to create input tensor '${name}': ORT error ${errCode}: ${errMsg}`);
+      }
       inputTensorHandles.push(tensorHandle);
       allocs.push(() => mod._OrtReleaseTensor(tensorHandle));
 
@@ -215,8 +241,8 @@ export async function runSession(session, feeds) {
       mod.setValue(outputNamesOffset + i * ptrSize, session.outputNamesEncoded[i], '*');
     }
 
-    // Run inference
-    const errorCode = await mod._OrtRun(
+    // Run inference (synchronous — WASM export, not asyncify)
+    const errorCode = mod._OrtRun(
       session.handle,
       inputNamesOffset,
       inputValuesOffset,
