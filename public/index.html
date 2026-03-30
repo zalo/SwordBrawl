@@ -102,7 +102,7 @@ canvas { display: block; }
     <div id="playerCount">Players: 0</div>
 </div>
 
-<div id="lock-on-btn" onclick="toggleLockOn()">Lock [Tab]</div>
+<div id="lock-on-btn">Lock [Tab]</div>
 
 <div id="name-panel">
     <label>Name: <input id="nameInput" type="text" maxlength="20" placeholder="Enter name..." /></label>
@@ -584,6 +584,10 @@ function initInputHandlers() {
   bindBtn('btn-kick', v => { actionKick = v; });
   bindBtn('btn-block', v => { actionBlock = v; });
   bindBtn('btn-jump', v => { actionJump = v; });
+
+  // Lock-on button
+  document.getElementById('lock-on-btn').addEventListener('click', toggleLockOn);
+  document.getElementById('lock-on-btn').addEventListener('touchstart', e => { e.preventDefault(); toggleLockOn(); }, { passive: false });
 
   // Name input
   const nameInput = document.getElementById('nameInput');
