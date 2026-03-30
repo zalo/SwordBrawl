@@ -650,6 +650,7 @@ function toggleLockOn() {
   if (lockOnEnabled) {
     // Find nearest player at the moment of activation
     lockOnTargetId = findNearestPlayerId();
+    console.log('Lock-on target:', lockOnTargetId, 'available:', Object.keys(playerPoses).filter(p => p !== myPlayerId));
     btn.classList.add('active');
     btn.textContent = lockOnTargetId ? 'Locked [Tab]' : 'No target [Tab]';
     if (!lockOnTargetId) { lockOnEnabled = false; btn.classList.remove('active'); }
@@ -687,17 +688,13 @@ function updateThirdPersonCamera() {
     const tp = playerPoses[lockOnTargetId];
     // Direction from me to target in PhysX XY plane
     const dx = tp[0] - px2, dy = tp[1] - py2;
-    // Target yaw: camera looks FROM behind me TOWARD the target
-    // Camera is at yaw angle behind the character, so we want yaw such that
-    // the character faces the target. Camera yaw = direction from char to camera.
-    // Character faces opposite of camera yaw direction.
-    // So targetYaw = atan2(dy, dx) + PI (camera behind the facing direction)
-    const targetYaw = Math.atan2(dy, dx) + Math.PI;
+    // Camera yaw = direction character faces (due to negated faceDir)
+    const targetYaw = Math.atan2(dy, dx);
     // Smoothly interpolate yaw (handle wrap-around)
     let diff = targetYaw - tpCamYaw;
     while (diff > Math.PI) diff -= 2 * Math.PI;
     while (diff < -Math.PI) diff += 2 * Math.PI;
-    tpCamYaw += diff * 0.08;
+    tpCamYaw += diff * 0.15;
     // Clear target if player disconnected
   } else if (lockOnEnabled && lockOnTargetId && !playerPoses[lockOnTargetId]) {
     lockOnEnabled = false;
