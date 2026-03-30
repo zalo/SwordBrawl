@@ -693,7 +693,7 @@ function updateThirdPersonCamera() {
     // Direction from me to target in PhysX XY plane
     const dx = tp[0] - px2, dy = tp[1] - py2;
     // Camera yaw = direction character faces (due to negated faceDir)
-    const targetYaw = Math.atan2(dy, dx);
+    const targetYaw = Math.atan2(dy, dx) + Math.PI;
     // Smoothly interpolate yaw (handle wrap-around)
     let diff = targetYaw - tpCamYaw;
     while (diff > Math.PI) diff -= 2 * Math.PI;
