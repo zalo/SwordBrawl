@@ -1155,7 +1155,6 @@ class PartyServer {
     const pkHost = this.room.env?.PARTYKIT_HOST || 'swordbrawl.zalo.partykit.dev';
     const pkProto = pkHost.startsWith('localhost') || pkHost.startsWith('127.') ? 'http' : 'https';
     const baseUrl = `${pkProto}://${pkHost}`;
-    console.log('room.env keys:', Object.keys(this.room.env || {}));
 
     try {
       await initOrt();
