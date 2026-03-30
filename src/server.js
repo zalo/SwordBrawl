@@ -1151,14 +1151,14 @@ class PartyServer {
     console.log('PhysX initialized');
 
     // Load ONNX models via our custom ORT wrapper (bypasses ort npm)
-    // Fetch ONNX models from our own static file serving
-    // In dev: PARTYKIT_HOST = 127.0.0.1:PORT, in prod: swordbrawl.zalo.partykit.dev
-    const pkHost = this.room.env?.PARTYKIT_HOST || 'localhost:1999';
+    // Fetch ONNX model files from our own static file serving
+    const pkHost = this.room.env?.PARTYKIT_HOST || 'swordbrawl.zalo.partykit.dev';
     const pkProto = pkHost.startsWith('localhost') || pkHost.startsWith('127.') ? 'http' : 'https';
     const baseUrl = `${pkProto}://${pkHost}`;
+    console.log('room.env keys:', Object.keys(this.room.env || {}));
 
     try {
-      await initOrt(`${baseUrl}/ort-wasm-simd-threaded.wasm`);
+      await initOrt();
       console.log('ORT WASM module ready');
     } catch(e) {
       console.error('ORT init failed:', e);
