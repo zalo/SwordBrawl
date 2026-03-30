@@ -577,8 +577,8 @@ function getSteeringFromInput() {
 
   const speed = Math.min(mag, 1) * 2.5;
 
-  let moveDirX = fwdX * iy + rightX * ix;
-  let moveDirY = fwdY * iy + rightY * ix;
+  let moveDirX = -fwdX * iy - rightX * ix;
+  let moveDirY = -fwdY * iy - rightY * ix;
   const mLen = Math.sqrt(moveDirX*moveDirX + moveDirY*moveDirY) || 1;
   moveDirX /= mLen; moveDirY /= mLen;
 

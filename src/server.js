@@ -747,7 +747,7 @@ class PlayerHumanoid {
           }
         }
         if (shape) {
-          shape.setSimulationFilterData(new px.PxFilterData(2, 5, 0, 0));
+          shape.setSimulationFilterData(new px.PxFilterData(2, 3, 0, 0));
           link.attachShape(shape);
         }
       }
