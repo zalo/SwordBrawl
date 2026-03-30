@@ -357,11 +357,9 @@ function updateLabels() {
     label.div.textContent = info.name;
     label.div.style.color = info.color || '#fff';
 
-    // Head position is approximately the root (link 0) + some height
-    // Root is in Z-up (PhysX coords), link[0] = px,py,pz,qx,qy,qz,qw
+    // Root is in Z-up PhysX coords; worldGroup rotation handles Z-up → Y-up
     const px = poses[0], py = poses[1], pz = poses[2];
-    // Convert Z-up to Y-up for projection: Three.js worldGroup has -90deg X rotation
-    const worldPos = new THREE.Vector3(px, pz + 0.4, -py);
+    const worldPos = new THREE.Vector3(px, py, pz + 0.4);
     worldGroup.localToWorld(worldPos);
 
     const screenPos = worldPos.project(camera);
