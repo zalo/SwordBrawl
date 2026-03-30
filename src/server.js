@@ -990,6 +990,50 @@ class PlayerHumanoid {
     return taskObs;
   }
 
+  /** Build 15-dim strike task obs targeting another humanoid's root link */
+  buildStrikeTaskObs(targetPlayer) {
+    const taskObs = new Float32Array(15);
+    const rootPose = this.links[0].link.getGlobalPose();
+    const rpx = rootPose.get_p();
+    const rqx = rootPose.get_q();
+    const rootPos = [rpx.get_x(), rpx.get_y(), rpx.get_z()];
+    const rootRot = [rqx.get_x(), rqx.get_y(), rqx.get_z(), rqx.get_w()];
+    const headingInv = calcHeadingQuatInv(rootRot);
+
+    // Target root state
+    const tPose = targetPlayer.links[0].link.getGlobalPose();
+    const tp = tPose.get_p();
+    const tq = tPose.get_q();
+    const tarPos = [tp.get_x(), tp.get_y(), tp.get_z()];
+    const tarRot = [tq.get_x(), tq.get_y(), tq.get_z(), tq.get_w()];
+    const tv = targetPlayer.links[0].link.getLinearVelocity();
+    const tarVel = [tv.get_x(), tv.get_y(), tv.get_z()];
+    const tav = targetPlayer.links[0].link.getAngularVelocity();
+    const tarAngVel = [tav.get_x(), tav.get_y(), tav.get_z()];
+
+    let idx = 0;
+
+    // [0-2] local_tar_pos: XY relative, Z absolute
+    const tarRel = [tarPos[0] - rootPos[0], tarPos[1] - rootPos[1], tarPos[2]];
+    const localTarPos = quatRotateVec(headingInv, tarRel);
+    taskObs[idx++] = localTarPos[0]; taskObs[idx++] = localTarPos[1]; taskObs[idx++] = localTarPos[2];
+
+    // [3-8] local_tar_rot as tan_norm (6D)
+    const localTarRot = quatMul(headingInv, tarRot);
+    const tn = quatToTanNorm(localTarRot);
+    for (let i = 0; i < 6; i++) taskObs[idx++] = tn[i];
+
+    // [9-11] local_tar_vel
+    const localTarVel = quatRotateVec(headingInv, tarVel);
+    taskObs[idx++] = localTarVel[0]; taskObs[idx++] = localTarVel[1]; taskObs[idx++] = localTarVel[2];
+
+    // [12-14] local_tar_ang_vel
+    const localTarAngVel = quatRotateVec(headingInv, tarAngVel);
+    taskObs[idx++] = localTarAngVel[0]; taskObs[idx++] = localTarAngVel[1]; taskObs[idx++] = localTarAngVel[2];
+
+    return taskObs;
+  }
+
   applyActions(action, humanoidData) {
     const bodyLinkMap = {};
     for (const l of this.links) bodyLinkMap[l.name] = l.link;
@@ -1057,7 +1101,32 @@ function runInferenceForPlayer(sessionHLC, sessionLLC, obs, taskObs, humanoidDat
   else if (player.actionBlock) actionLatent = ACTION_LATENTS.block;
   else if (player.actionJump) actionLatent = ACTION_LATENTS.jump;
 
-  if (actionLatent) {
+  // Check if player is also steering (joystick/WASD non-zero while action held)
+  const hasMovement = player.speed > 0.1;
+
+  if (actionLatent && hasMovement && sessionHLC) {
+    // Blend 50% between action latent and steering latent (spherical interp on latent)
+    const hlcResult = runSession(sessionHLC, {
+      obs: { data: obs, dims: [1, obsDim] },
+      task_obs: { data: taskObs, dims: [1, 5] },
+    });
+    const steerZ = hlcResult.z;
+    // Spherical blend: normalize the lerped latent onto the unit sphere
+    const blendedZ = new Float32Array(latentDim);
+    let norm = 0;
+    for (let i = 0; i < latentDim; i++) {
+      blendedZ[i] = 0.5 * actionLatent[i] + 0.5 * steerZ[i];
+      norm += blendedZ[i] * blendedZ[i];
+    }
+    norm = Math.sqrt(norm) || 1;
+    for (let i = 0; i < latentDim; i++) blendedZ[i] /= norm;
+
+    const llcResult = runSession(sessionLLC, {
+      obs: { data: obs, dims: [1, obsDim] },
+      latent: { data: blendedZ, dims: [1, latentDim] },
+    });
+    return llcResult.action;
+  } else if (actionLatent) {
     const llcResult = runSession(sessionLLC, {
       obs: { data: obs, dims: [1, obsDim] },
       latent: { data: actionLatent, dims: [1, latentDim] },
@@ -1076,6 +1145,23 @@ function runInferenceForPlayer(sessionHLC, sessionLLC, obs, taskObs, humanoidDat
     });
     return llcResult.action;
   }
+}
+
+function runStrikeInference(sessionHLCStrike, sessionLLC, obs, strikeTaskObs, humanoidData) {
+  const obsDim = humanoidData.obs_dim;
+  const latentDim = humanoidData.latent_dim || 64;
+
+  if (!sessionHLCStrike) return null;
+  const hlcResult = runSession(sessionHLCStrike, {
+    obs: { data: obs, dims: [1, obsDim] },
+    task_obs: { data: strikeTaskObs, dims: [1, 15] },
+  });
+  const z = hlcResult.z;
+  const llcResult = runSession(sessionLLC, {
+    obs: { data: obs, dims: [1, obsDim] },
+    latent: { data: z, dims: [1, latentDim] },
+  });
+  return llcResult.action;
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1187,11 @@ class PartyServer {
     // ONNX sessions (from ort-server.js)
     this.sessionLLC = null;
     this.sessionHLC = null;
+    this.sessionHLCStrike = null;
+
+    // CPU player
+    this.cpuPlayer = null;
+    this.CPU_PLAYER_ID = '__cpu__';
 
     // Humanoid template data
     this.humanoidData = null;
@@ -1219,17 +1310,60 @@ class PartyServer {
       const hlcResp = await fetch(`${baseUrl}/hlc_steering_v2.onnx`);
       const hlcBuf = await hlcResp.arrayBuffer();
       console.log('HLC fetched:', hlcBuf.byteLength, 'bytes');
-      this.sessionHLC = await createSession(new Uint8Array(hlcBuf));
-      console.log('HLC session created');
+      this.sessionHLC = createSession(new Uint8Array(hlcBuf));
+      console.log('HLC steering session created');
     } catch(e) {
-      console.error('HLC session creation failed:', e);
+      console.error('HLC steering session creation failed:', e);
     }
+
+    try {
+      const strikeResp = await fetch(`${baseUrl}/hlc_strike.onnx`);
+      const strikeBuf = await strikeResp.arrayBuffer();
+      console.log('HLC strike fetched:', strikeBuf.byteLength, 'bytes');
+      this.sessionHLCStrike = createSession(new Uint8Array(strikeBuf));
+      console.log('HLC strike session created');
+    } catch(e) {
+      console.error('HLC strike session creation failed:', e);
+    }
+
+    // Spawn CPU player
+    this._spawnCpuPlayer();
 
     // Start tick loop (all inference is synchronous WASM calls)
     this.lastPhysTime = Date.now();
     this.interval = setInterval(() => this._tick(), 1000 / TICK_HZ);
 
     console.log('Server ready');
+  }
+
+  _findNearestHumanPlayer(cpuPlayer) {
+    let nearest = null;
+    let nearestDist = Infinity;
+    const cpuPose = cpuPlayer.links[0].link.getGlobalPose().get_p();
+    const cx = cpuPose.get_x(), cy = cpuPose.get_y();
+
+    for (const pid in this.players) {
+      if (pid === this.CPU_PLAYER_ID) continue;
+      const p = this.players[pid];
+      const pose = p.links[0].link.getGlobalPose().get_p();
+      const dx = pose.get_x() - cx, dy = pose.get_y() - cy;
+      const dist = dx * dx + dy * dy;
+      if (dist < nearestDist) { nearestDist = dist; nearest = p; }
+    }
+    return nearest;
+  }
+
+  _spawnCpuPlayer() {
+    if (this.cpuPlayer) {
+      this.cpuPlayer.destroy(this.pxScene);
+    }
+    const spawnIndex = this.globalPlayerCount++;
+    this.cpuPlayer = new PlayerHumanoid(this.CPU_PLAYER_ID, this.px, this.physics, this.pxScene, this.material, this.humanoidData, spawnIndex);
+    this.cpuPlayer._spawnIndex = spawnIndex;
+    this.cpuPlayer.name = 'CPU';
+    this.cpuPlayer.color = '#ff4444';
+    this.players[this.CPU_PLAYER_ID] = this.cpuPlayer;
+    console.log('CPU player spawned');
   }
 
   _tick() {
@@ -1262,9 +1396,21 @@ class PartyServer {
           if (this.sessionLLC) {
             try {
               const obs = player.buildObservation(this.humanoidData);
-              const taskObs = player.buildTaskObs();
-              const action = runInferenceForPlayer(
-                this.sessionHLC, this.sessionLLC, obs, taskObs, this.humanoidData, player);
+              let action;
+
+              if (pid === this.CPU_PLAYER_ID && this.sessionHLCStrike) {
+                // CPU player: strike the nearest human player
+                const target = this._findNearestHumanPlayer(player);
+                if (target) {
+                  const strikeObs = player.buildStrikeTaskObs(target);
+                  action = runStrikeInference(
+                    this.sessionHLCStrike, this.sessionLLC, obs, strikeObs, this.humanoidData);
+                }
+              } else {
+                const taskObs = player.buildTaskObs();
+                action = runInferenceForPlayer(
+                  this.sessionHLC, this.sessionLLC, obs, taskObs, this.humanoidData, player);
+              }
               if (action) {
                 player.currentAction = action;
                 player.applyActions(action, this.humanoidData);
@@ -1343,6 +1489,7 @@ class PartyServer {
     // Clean up stale players from connections that no longer exist
     const activeIds = new Set([...this.room.getConnections()].map(c => c.id));
     for (const pid in this.players) {
+      if (pid === this.CPU_PLAYER_ID) continue;
       if (!activeIds.has(pid)) {
         console.log('Cleaning stale player:', pid);
         this.players[pid].destroy(this.pxScene);

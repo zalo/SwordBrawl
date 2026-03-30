@@ -359,7 +359,7 @@ function updateLabels() {
 
     // Root is in Z-up PhysX coords; worldGroup rotation handles Z-up → Y-up
     const px = poses[0], py = poses[1], pz = poses[2];
-    const worldPos = new THREE.Vector3(px, py, pz + 0.4);
+    const worldPos = new THREE.Vector3(px, py, pz + 0.7);
     worldGroup.localToWorld(worldPos);
 
     const screenPos = worldPos.project(camera);
@@ -473,31 +473,41 @@ function initInputHandlers() {
   // Touch joystick
   const jzone = document.getElementById('joystick-zone');
   const knob = document.getElementById('joystick-knob');
+  let joystickTouchId = null;
   jzone.addEventListener('touchstart', e => {
     e.preventDefault();
+    // Track this specific touch by identifier
+    const t = e.changedTouches[0];
+    joystickTouchId = t.identifier;
     joystickActive = true;
-    const t = e.touches[0];
     const rect = jzone.getBoundingClientRect();
     joystickOriginX = rect.left + 70;
     joystickOriginY = rect.top + 70;
   }, { passive: false });
   window.addEventListener('touchmove', e => {
-    if (!joystickActive) return;
-    const t = e.touches[0];
-    let dx = t.clientX - joystickOriginX;
-    let dy = t.clientY - joystickOriginY;
-    const dist = Math.sqrt(dx*dx + dy*dy);
-    const maxR = 45;
-    if (dist > maxR) { dx = dx/dist*maxR; dy = dy/dist*maxR; }
-    knob.style.left = (45 + dx) + 'px';
-    knob.style.top = (45 + dy) + 'px';
-    inputX = dx / maxR;
-    inputY = -dy / maxR;
+    if (joystickTouchId === null) return;
+    for (const t of e.changedTouches) {
+      if (t.identifier !== joystickTouchId) continue;
+      let dx = t.clientX - joystickOriginX;
+      let dy = t.clientY - joystickOriginY;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      const maxR = 45;
+      if (dist > maxR) { dx = dx/dist*maxR; dy = dy/dist*maxR; }
+      knob.style.left = (45 + dx) + 'px';
+      knob.style.top = (45 + dy) + 'px';
+      inputX = dx / maxR;
+      inputY = -dy / maxR;
+    }
   }, { passive: true });
-  window.addEventListener('touchend', () => {
-    joystickActive = false;
-    knob.style.left = '45px'; knob.style.top = '45px';
-    inputX = 0; inputY = 0;
+  window.addEventListener('touchend', e => {
+    for (const t of e.changedTouches) {
+      if (t.identifier === joystickTouchId) {
+        joystickTouchId = null;
+        joystickActive = false;
+        knob.style.left = '45px'; knob.style.top = '45px';
+        inputX = 0; inputY = 0;
+      }
+    }
   });
 
   // Touch camera (single finger on canvas)
