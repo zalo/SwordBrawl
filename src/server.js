@@ -660,7 +660,7 @@ class PlayerHumanoid {
     art.setSolverIterationCounts(4, 0);
     if (typeof art.setSleepThreshold === 'function') art.setSleepThreshold(5e-5);
     if (typeof art.setStabilizationThreshold === 'function') art.setStabilizationThreshold(1e-5);
-    art.setArticulationFlag(px.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true);
+    art.setArticulationFlag(px.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, false);
 
     this.articulation = art;
 
