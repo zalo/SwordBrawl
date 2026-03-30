@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SwordBrawl</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; }
+#overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(26,26,46,0.95); z-index: 10;
+    flex-direction: column; color: #e0e0ff;
+}
+#overlay h1 { font-size: 2em; margin-bottom: 0.5em; }
+#overlay .status { font-size: 1.1em; opacity: 0.8; margin-top: 0.5em; }
+#overlay .spinner {
+    width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.15);
+    border-top-color: #7c83ff; border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin: 1em;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#joystick-zone {
+    position: absolute; bottom: 40px; left: 40px;
+    width: 140px; height: 140px; z-index: 6;
+    display: none;
+}
+#action-buttons {
+    position: absolute; bottom: 40px; right: 40px; z-index: 6; display: none;
+    grid-template-columns: 65px 65px; grid-template-rows: 65px 65px; gap: 8px;
+}
+#action-buttons button {
+    background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3);
+    color: white; font-size: 12px; width: 65px; height: 65px; border-radius: 50%;
+    user-select: none; touch-action: none; cursor: pointer; outline: none;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+#action-buttons button.active, #action-buttons button:active {
+    background: rgba(255,255,255,0.4); border-color: rgba(255,255,255,0.6);
+}
+#joystick-base {
+    position: absolute; width: 140px; height: 140px;
+    border-radius: 50%; background: rgba(255,255,255,0.12);
+    border: 2px solid rgba(255,255,255,0.25);
+}
+#joystick-knob {
+    position: absolute; width: 50px; height: 50px;
+    border-radius: 50%; background: rgba(255,255,255,0.35);
+    left: 45px; top: 45px; pointer-events: none;
+}
+#hud {
+    position: absolute; top: 12px; left: 16px; color: #b0b0d0;
+    font-size: 13px; line-height: 1.6; pointer-events: none; z-index: 5;
+}
+#hud .title { font-size: 15px; font-weight: 600; color: #d0d0ff; }
+#controls-hud {
+    position: absolute; bottom: 16px; left: 16px; color: rgba(200,200,240,0.7);
+    font-size: 12px; line-height: 1.8; pointer-events: none; z-index: 5;
+    font-family: 'Segoe UI', sans-serif;
+}
+#controls-hud .ch-title { font-size: 13px; font-weight: 600; color: rgba(220,220,255,0.9); margin-bottom: 4px; }
+#name-panel {
+    position: absolute; top: 12px; right: 16px; z-index: 7;
+    background: rgba(30,30,60,0.85); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px; padding: 10px 14px; color: #e0e0ff; font-size: 13px;
+}
+#name-panel input {
+    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.25);
+    color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 13px;
+    outline: none; width: 140px; margin-left: 6px;
+}
+#name-panel input:focus { border-color: #7c83ff; }
+#player-list {
+    position: absolute; top: 60px; right: 16px; z-index: 5;
+    color: #b0b0d0; font-size: 12px; line-height: 1.8;
+    pointer-events: none;
+}
+.player-entry { display: flex; align-items: center; gap: 6px; }
+.player-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+    <h1>SwordBrawl</h1>
+    <div class="spinner"></div>
+    <div class="status" id="loadStatus">Connecting to server...</div>
+</div>
+
+<div id="hud">
+    <div class="title">SwordBrawl</div>
+    <div id="fpsDisplay">FPS: --</div>
+    <div id="playerCount">Players: 0</div>
+</div>
+
+<div id="name-panel">
+    <label>Name: <input id="nameInput" type="text" maxlength="20" placeholder="Enter name..." /></label>
+</div>
+
+<div id="player-list"></div>
+
+<div id="controls-hud">
+    <div class="ch-title">Controls</div>
+    <div><b>WASD</b> — Move</div>
+    <div><b>Right-click drag</b> — Rotate camera</div>
+    <div><b>Scroll</b> — Zoom</div>
+    <div><b>Left click</b> — Slash</div>
+    <div><b>Space</b> — Jump</div>
+    <div><b>Q</b> — Kick</div>
+    <div><b>E</b> — Block</div>
+</div>
+
+<div id="joystick-zone">
+    <div id="joystick-base">
+        <div id="joystick-knob"></div>
+    </div>
+</div>
+
+<div id="action-buttons">
+    <button id="btn-jump">&#x2B06;<br>Jump</button>
+    <button id="btn-slash">&#x2694;<br>Slash</button>
+    <button id="btn-kick">&#x1F9B6;<br>Kick</button>
+    <button id="btn-block">&#x1F6E1;<br>Block</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "partysocket": "https://cdn.jsdelivr.net/npm/partysocket@1.1.4/dist/index.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import PartySocket from 'partysocket';
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const PARTYKIT_HOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'localhost:1999'
+  : 'swordbrawl.zalo.partykit.dev';
+
+const BODY_COLORS = {
+  pelvis: 0x5577aa, torso: 0x5577aa, head: 0xcc8866,
+  right_upper_arm: 0x77aa55, right_lower_arm: 0x77aa55, right_hand: 0xcc8866,
+  sword: 0xcccccc,
+  left_upper_arm: 0xaa7755, left_lower_arm: 0xaa7755, shield: 0x8888cc, left_hand: 0xcc8866,
+  right_thigh: 0x5577aa, right_shin: 0x5577aa, right_foot: 0x555577,
+  left_thigh: 0x5577aa, left_shin: 0x5577aa, left_foot: 0x555577,
+};
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let renderer, camera, scene3d, controls, worldGroup;
+let conn = null;
+let myPlayerId = null;
+let bodies = null;  // humanoid body geometry template from server
+
+// Per-player rendering state
+const playerMeshes = {};   // playerId -> [THREE.Group per link]
+const playerLabels = {};   // playerId -> { div, name, color }
+const playerPoses = {};    // playerId -> Float32Array (latest poses)
+const playerPosesPrev = {}; // playerId -> Float32Array (previous for interp)
+const playerPosesTime = {}; // playerId -> timestamp of last update
+const playerInfo = {};     // playerId -> { name, color }
+
+// Input state
+let inputX = 0, inputY = 0;
+const keysDown = {};
+let actionSlash = false, actionKick = false, actionBlock = false, actionJump = false;
+
+// Third-person camera
+let tpCamDistance = 5.0;
+let tpCamHeight = 2.5;
+let tpCamYaw = 0;
+let tpCamPitch = 0.35;
+let camMouseDown = false;
+let camLastX = 0, camLastY = 0;
+
+let frameCount = 0, lastFpsTime = 0;
+
+// Joystick
+let joystickActive = false;
+let joystickOriginX = 0, joystickOriginY = 0;
+
+// ---------------------------------------------------------------------------
+// Three.js setup
+// ---------------------------------------------------------------------------
+function initThreeJS() {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  document.body.appendChild(renderer.domElement);
+
+  scene3d = new THREE.Scene();
+  scene3d.background = new THREE.Color(0x1a1a2e);
+  scene3d.fog = new THREE.Fog(0x1a1a2e, 20, 60);
+
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
+  camera.position.set(3, 2, 4);
+  camera.lookAt(0, 1, 0);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.1;
+  controls.enabled = false; // third-person by default
+  controls.update();
+
+  scene3d.add(new THREE.AmbientLight(0x404060, 0.6));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+  dirLight.position.set(5, 10, 5);
+  dirLight.castShadow = true;
+  dirLight.shadow.mapSize.set(2048, 2048);
+  dirLight.shadow.camera.near = 0.5;
+  dirLight.shadow.camera.far = 50;
+  dirLight.shadow.camera.left = -15;
+  dirLight.shadow.camera.right = 15;
+  dirLight.shadow.camera.top = 15;
+  dirLight.shadow.camera.bottom = -15;
+  scene3d.add(dirLight);
+  scene3d.add(new THREE.HemisphereLight(0x8888cc, 0x444422, 0.4));
+
+  worldGroup = new THREE.Group();
+  worldGroup.rotation.x = -Math.PI / 2;
+  scene3d.add(worldGroup);
+
+  // Ground
+  const groundMat = new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.9, metalness: 0.1 });
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), groundMat);
+  ground.receiveShadow = true;
+  worldGroup.add(ground);
+
+  const grid = new THREE.GridHelper(80, 80, 0x333355, 0x2a2a44);
+  grid.rotation.x = Math.PI / 2;
+  worldGroup.add(grid);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Create mesh groups for a player's humanoid
+// ---------------------------------------------------------------------------
+function createPlayerMeshes(playerId, tintMultiplier) {
+  if (!bodies) return;
+  const groups = [];
+  for (const body of bodies) {
+    const group = new THREE.Group();
+    const baseColor = BODY_COLORS[body.name] || 0x888888;
+
+    // Apply player tint
+    const c = new THREE.Color(baseColor);
+    if (tintMultiplier) {
+      const tc = new THREE.Color(tintMultiplier);
+      c.lerp(tc, 0.3);
+    }
+
+    for (const geom of body.geoms) {
+      const mat = new THREE.MeshStandardMaterial({ color: c, roughness: 0.6, metalness: 0.2 });
+      let mesh = null;
+
+      if (geom.type === 'sphere') {
+        mesh = new THREE.Mesh(new THREE.SphereGeometry(geom.radius, 16, 12), mat);
+        mesh.position.set(geom.pos[0], geom.pos[1], geom.pos[2]);
+      } else if (geom.type === 'capsule' && geom.fromto) {
+        const ft = geom.fromto;
+        const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+        const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+        const dir = new THREE.Vector3().subVectors(p1, p0);
+        const len = dir.length();
+        mesh = new THREE.Mesh(new THREE.CapsuleGeometry(geom.radius, len, 8, 12), mat);
+        mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+        if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+      } else if (geom.type === 'box') {
+        const he = geom.halfExtents;
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(he[0]*2, he[1]*2, he[2]*2), mat);
+        mesh.position.set(geom.pos[0], geom.pos[1], geom.pos[2]);
+      } else if (geom.type === 'cylinder') {
+        const r = geom.radius;
+        if (geom.fromto) {
+          const ft = geom.fromto;
+          const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+          const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+          const dir = new THREE.Vector3().subVectors(p1, p0);
+          const len = Math.max(dir.length(), 0.01);
+          mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 16), mat);
+          mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+          if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+        } else {
+          const hh = geom.halfHeight || 0.015;
+          mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, hh*2, 16), mat);
+          const lp = geom.pos || [0,0,0];
+          mesh.position.set(lp[0], lp[1], lp[2]);
+        }
+      }
+      if (mesh) {
+        mesh.castShadow = true;
+        group.add(mesh);
+      }
+    }
+    worldGroup.add(group);
+    groups.push(group);
+  }
+  playerMeshes[playerId] = groups;
+}
+
+function removePlayerMeshes(playerId) {
+  const groups = playerMeshes[playerId];
+  if (groups) {
+    for (const g of groups) worldGroup.remove(g);
+    delete playerMeshes[playerId];
+  }
+  const label = playerLabels[playerId];
+  if (label && label.div) {
+    label.div.remove();
+    delete playerLabels[playerId];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Name labels (HTML divs projected to 3D)
+// ---------------------------------------------------------------------------
+function ensureLabel(playerId) {
+  if (playerLabels[playerId]) return playerLabels[playerId];
+  const div = document.createElement('div');
+  div.style.cssText = 'position:absolute;color:#fff;font-size:13px;font-weight:600;pointer-events:none;z-index:4;text-shadow:0 0 4px rgba(0,0,0,0.8);white-space:nowrap;transform:translate(-50%,-100%);';
+  document.body.appendChild(div);
+  playerLabels[playerId] = { div };
+  return playerLabels[playerId];
+}
+
+function updateLabels() {
+  for (const pid in playerPoses) {
+    const poses = playerPoses[pid];
+    if (!poses || poses.length < 7) continue;
+    const info = playerInfo[pid];
+    if (!info) continue;
+
+    const label = ensureLabel(pid);
+    label.div.textContent = info.name;
+    label.div.style.color = info.color || '#fff';
+
+    // Head position is approximately the root (link 0) + some height
+    // Root is in Z-up (PhysX coords), link[0] = px,py,pz,qx,qy,qz,qw
+    const px = poses[0], py = poses[1], pz = poses[2];
+    // Convert Z-up to Y-up for projection: Three.js worldGroup has -90deg X rotation
+    const worldPos = new THREE.Vector3(px, pz + 0.4, -py);
+    worldGroup.localToWorld(worldPos);
+
+    const screenPos = worldPos.project(camera);
+    const hw = window.innerWidth / 2, hh = window.innerHeight / 2;
+    label.div.style.left = (screenPos.x * hw + hw) + 'px';
+    label.div.style.top = (-screenPos.y * hh + hh - 20) + 'px';
+    label.div.style.display = (screenPos.z > 0 && screenPos.z < 1) ? 'block' : 'none';
+  }
+
+  // Remove labels for disconnected players
+  for (const pid in playerLabels) {
+    if (!playerPoses[pid]) {
+      playerLabels[pid].div.remove();
+      delete playerLabels[pid];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Apply poses from server (with interpolation)
+// ---------------------------------------------------------------------------
+function updateMeshPoses() {
+  const now = performance.now();
+  for (const pid in playerMeshes) {
+    const groups = playerMeshes[pid];
+    const curr = playerPoses[pid];
+    const prev = playerPosesPrev[pid];
+    const lastTime = playerPosesTime[pid] || now;
+    if (!curr) continue;
+
+    // Interpolation factor (server sends at ~20Hz = 50ms)
+    const elapsed = now - lastTime;
+    const t = Math.min(elapsed / 50, 1.0);
+
+    for (let i = 0; i < groups.length && i * 7 + 6 < curr.length; i++) {
+      const off = i * 7;
+      let px2, py2, pz2, qx, qy, qz, qw;
+
+      if (prev && prev.length >= off + 7) {
+        // Lerp position
+        px2 = prev[off]   + (curr[off]   - prev[off])   * t;
+        py2 = prev[off+1] + (curr[off+1] - prev[off+1]) * t;
+        pz2 = prev[off+2] + (curr[off+2] - prev[off+2]) * t;
+        // Slerp quaternion (approximate with nlerp)
+        qx = prev[off+3] + (curr[off+3] - prev[off+3]) * t;
+        qy = prev[off+4] + (curr[off+4] - prev[off+4]) * t;
+        qz = prev[off+5] + (curr[off+5] - prev[off+5]) * t;
+        qw = prev[off+6] + (curr[off+6] - prev[off+6]) * t;
+        const qlen = Math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw) || 1;
+        qx /= qlen; qy /= qlen; qz /= qlen; qw /= qlen;
+      } else {
+        px2 = curr[off]; py2 = curr[off+1]; pz2 = curr[off+2];
+        qx = curr[off+3]; qy = curr[off+4]; qz = curr[off+5]; qw = curr[off+6];
+      }
+
+      groups[i].position.set(px2, py2, pz2);
+      groups[i].quaternion.set(qx, qy, qz, qw);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input handling
+// ---------------------------------------------------------------------------
+function initInputHandlers() {
+  const isTouchDevice = 'ontouchstart' in window;
+
+  if (isTouchDevice) {
+    document.getElementById('joystick-zone').style.display = 'block';
+    document.getElementById('action-buttons').style.display = 'grid';
+    document.getElementById('controls-hud').style.display = 'none';
+  }
+
+  // Keyboard
+  window.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT') return;
+    keysDown[e.key.toLowerCase()] = true;
+    if (e.key === ' ') { actionJump = true; e.preventDefault(); }
+    if (e.key.toLowerCase() === 'q') actionKick = true;
+    if (e.key.toLowerCase() === 'e') actionBlock = true;
+  });
+  window.addEventListener('keyup', e => {
+    keysDown[e.key.toLowerCase()] = false;
+    if (e.key === ' ') actionJump = false;
+    if (e.key.toLowerCase() === 'q') actionKick = false;
+    if (e.key.toLowerCase() === 'e') actionBlock = false;
+  });
+
+  // Mouse for camera + slash
+  renderer.domElement.addEventListener('mousedown', e => {
+    if (e.button === 0) { actionSlash = true; }
+    if (e.button === 2) { camMouseDown = true; camLastX = e.clientX; camLastY = e.clientY; }
+  });
+  window.addEventListener('mouseup', e => {
+    if (e.button === 0) actionSlash = false;
+    if (e.button === 2) camMouseDown = false;
+  });
+  window.addEventListener('mousemove', e => {
+    if (!camMouseDown) return;
+    const dx = e.clientX - camLastX;
+    const dy = e.clientY - camLastY;
+    camLastX = e.clientX; camLastY = e.clientY;
+    tpCamYaw -= dx * 0.005;
+    tpCamPitch = Math.max(-0.5, Math.min(1.2, tpCamPitch + dy * 0.005));
+  });
+  renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+  renderer.domElement.addEventListener('wheel', e => {
+    tpCamDistance = Math.max(2, Math.min(15, tpCamDistance + e.deltaY * 0.01));
+  });
+
+  // Touch joystick
+  const jzone = document.getElementById('joystick-zone');
+  const knob = document.getElementById('joystick-knob');
+  jzone.addEventListener('touchstart', e => {
+    e.preventDefault();
+    joystickActive = true;
+    const t = e.touches[0];
+    const rect = jzone.getBoundingClientRect();
+    joystickOriginX = rect.left + 70;
+    joystickOriginY = rect.top + 70;
+  }, { passive: false });
+  window.addEventListener('touchmove', e => {
+    if (!joystickActive) return;
+    const t = e.touches[0];
+    let dx = t.clientX - joystickOriginX;
+    let dy = t.clientY - joystickOriginY;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const maxR = 45;
+    if (dist > maxR) { dx = dx/dist*maxR; dy = dy/dist*maxR; }
+    knob.style.left = (45 + dx) + 'px';
+    knob.style.top = (45 + dy) + 'px';
+    inputX = dx / maxR;
+    inputY = -dy / maxR;
+  }, { passive: true });
+  window.addEventListener('touchend', () => {
+    joystickActive = false;
+    knob.style.left = '45px'; knob.style.top = '45px';
+    inputX = 0; inputY = 0;
+  });
+
+  // Touch camera (single finger on canvas)
+  let touchCamId = null;
+  let touchCamX = 0, touchCamY = 0;
+  renderer.domElement.addEventListener('touchstart', e => {
+    if (e.touches.length === 1 && !joystickActive) {
+      touchCamId = e.touches[0].identifier;
+      touchCamX = e.touches[0].clientX;
+      touchCamY = e.touches[0].clientY;
+    }
+  });
+  renderer.domElement.addEventListener('touchmove', e => {
+    if (touchCamId === null) return;
+    for (const t of e.touches) {
+      if (t.identifier === touchCamId) {
+        tpCamYaw -= (t.clientX - touchCamX) * 0.005;
+        tpCamPitch = Math.max(-0.5, Math.min(1.2, tpCamPitch + (t.clientY - touchCamY) * 0.005));
+        touchCamX = t.clientX; touchCamY = t.clientY;
+      }
+    }
+  });
+  renderer.domElement.addEventListener('touchend', e => {
+    touchCamId = null;
+  });
+
+  // Action buttons (touch)
+  function bindBtn(id, setAction) {
+    const btn = document.getElementById(id);
+    btn.addEventListener('touchstart', e => { e.preventDefault(); setAction(true); btn.classList.add('active'); }, { passive: false });
+    btn.addEventListener('touchend', () => { setAction(false); btn.classList.remove('active'); });
+    btn.addEventListener('touchcancel', () => { setAction(false); btn.classList.remove('active'); });
+  }
+  bindBtn('btn-slash', v => { actionSlash = v; });
+  bindBtn('btn-kick', v => { actionKick = v; });
+  bindBtn('btn-block', v => { actionBlock = v; });
+  bindBtn('btn-jump', v => { actionJump = v; });
+
+  // Name input
+  const nameInput = document.getElementById('nameInput');
+  const savedName = localStorage.getItem('swordbrawl_name');
+  if (savedName) nameInput.value = savedName;
+
+  nameInput.addEventListener('change', () => {
+    const name = nameInput.value.trim() || 'Player';
+    localStorage.setItem('swordbrawl_name', name);
+    if (conn && conn.readyState === WebSocket.OPEN) {
+      conn.send(JSON.stringify({ type: 'name', name }));
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Steering from input
+// ---------------------------------------------------------------------------
+function getSteeringFromInput() {
+  // WASD or joystick
+  let ix = inputX, iy = inputY;
+  if (keysDown['w'] || keysDown['arrowup']) iy += 1;
+  if (keysDown['s'] || keysDown['arrowdown']) iy -= 1;
+  if (keysDown['a'] || keysDown['arrowleft']) ix -= 1;
+  if (keysDown['d'] || keysDown['arrowright']) ix += 1;
+  const mag = Math.sqrt(ix*ix + iy*iy);
+  if (mag > 1) { ix /= mag; iy /= mag; }
+
+  // Camera-relative directions
+  const cosYaw = Math.cos(tpCamYaw);
+  const sinYaw = Math.sin(tpCamYaw);
+
+  // Forward = camera yaw direction in XY plane (Z-up physics coords)
+  // Camera yaw 0 = looking along +X
+  const fwdX = cosYaw;
+  const fwdY = sinYaw;
+  const rightX = -sinYaw;
+  const rightY = cosYaw;
+
+  const speed = Math.min(mag, 1) * 2.5;
+
+  let moveDirX = fwdX * iy + rightX * ix;
+  let moveDirY = fwdY * iy + rightY * ix;
+  const mLen = Math.sqrt(moveDirX*moveDirX + moveDirY*moveDirY) || 1;
+  moveDirX /= mLen; moveDirY /= mLen;
+
+  // Face direction = camera forward
+  const faceDirX = fwdX;
+  const faceDirY = fwdY;
+
+  return {
+    moveDir: [moveDirX, moveDirY],
+    faceDir: [faceDirX, faceDirY],
+    speed: speed,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Third-person camera
+// ---------------------------------------------------------------------------
+function updateThirdPersonCamera() {
+  if (!myPlayerId || !playerPoses[myPlayerId]) return;
+  const poses = playerPoses[myPlayerId];
+  const px2 = poses[0], py2 = poses[1], pz2 = poses[2];
+
+  // Character position in Three.js Y-up coords (worldGroup rotates -90 X)
+  const charX = px2, charY = Math.max(pz2, 0.5), charZ = -py2;
+
+  const camX = charX + tpCamDistance * Math.cos(tpCamYaw) * Math.cos(tpCamPitch);
+  const camZ = charZ - tpCamDistance * Math.sin(tpCamYaw) * Math.cos(tpCamPitch);
+  const camY = charY + tpCamDistance * Math.sin(tpCamPitch);
+
+  camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.15);
+  const target = new THREE.Vector3(charX, charY, charZ);
+  controls.target.lerp(target, 0.15);
+}
+
+// ---------------------------------------------------------------------------
+// Network: send input at 20Hz
+// ---------------------------------------------------------------------------
+let lastInputSend = 0;
+function sendInput() {
+  if (!conn || conn.readyState !== WebSocket.OPEN) return;
+  const now = performance.now();
+  if (now - lastInputSend < 50) return; // 20Hz
+  lastInputSend = now;
+
+  const steering = getSteeringFromInput();
+  conn.send(JSON.stringify({
+    type: 'input',
+    moveDir: steering.moveDir,
+    faceDir: steering.faceDir,
+    speed: steering.speed,
+    slash: actionSlash,
+    kick: actionKick,
+    block: actionBlock,
+    jump: actionJump,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Handle messages from server
+// ---------------------------------------------------------------------------
+function handleServerMessage(event) {
+  let data;
+  try { data = JSON.parse(event.data); } catch(e) { return; }
+
+  if (data.type === 'init') {
+    bodies = data.bodies;
+    myPlayerId = data.playerId;
+    document.getElementById('overlay').style.display = 'none';
+
+    // Send name if we have one
+    const name = document.getElementById('nameInput').value.trim();
+    if (name && conn) {
+      conn.send(JSON.stringify({ type: 'name', name }));
+    }
+  }
+
+  if (data.type === 'waiting') {
+    document.getElementById('loadStatus').textContent = data.message;
+  }
+
+  if (data.type === 'players') {
+    // Update player info
+    for (const pid in data.players) {
+      playerInfo[pid] = data.players[pid];
+    }
+    // Remove players no longer present
+    for (const pid in playerInfo) {
+      if (!data.players[pid]) {
+        removePlayerMeshes(pid);
+        delete playerInfo[pid];
+        delete playerPoses[pid];
+        delete playerPosesPrev[pid];
+      }
+    }
+    updatePlayerList();
+  }
+
+  if (data.type === 'state') {
+    const now = performance.now();
+    for (const pid in data.players) {
+      const p = data.players[pid];
+
+      // Update info
+      if (!playerInfo[pid]) playerInfo[pid] = {};
+      playerInfo[pid].name = p.name;
+      playerInfo[pid].color = p.color;
+
+      // Create meshes if needed
+      if (!playerMeshes[pid] && bodies) {
+        createPlayerMeshes(pid, p.color);
+      }
+
+      // Store poses for interpolation
+      playerPosesPrev[pid] = playerPoses[pid] || new Float32Array(p.poses);
+      playerPoses[pid] = new Float32Array(p.poses);
+      playerPosesTime[pid] = now;
+    }
+
+    // Remove players no longer in state
+    for (const pid in playerMeshes) {
+      if (!data.players[pid]) {
+        removePlayerMeshes(pid);
+        delete playerPoses[pid];
+        delete playerPosesPrev[pid];
+      }
+    }
+  }
+}
+
+function updatePlayerList() {
+  const list = document.getElementById('player-list');
+  const count = document.getElementById('playerCount');
+  const pids = Object.keys(playerInfo);
+  count.textContent = 'Players: ' + pids.length;
+
+  let html = '';
+  for (const pid of pids) {
+    const info = playerInfo[pid];
+    const isMe = pid === myPlayerId ? ' (you)' : '';
+    html += `<div class="player-entry"><span class="player-dot" style="background:${info.color}"></span>${info.name}${isMe}</div>`;
+  }
+  list.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+function mainLoop(timestamp) {
+  frameCount++;
+  if (timestamp - lastFpsTime > 1000) {
+    document.getElementById('fpsDisplay').textContent = `FPS: ${frameCount}`;
+    frameCount = 0;
+    lastFpsTime = timestamp;
+  }
+
+  sendInput();
+  updateMeshPoses();
+  updateThirdPersonCamera();
+  updateLabels();
+  controls.update();
+  renderer.render(scene3d, camera);
+  requestAnimationFrame(mainLoop);
+}
+
+// ---------------------------------------------------------------------------
+// Connect
+// ---------------------------------------------------------------------------
+function connect() {
+  const protocol = PARTYKIT_HOST.startsWith('localhost') ? 'ws' : 'wss';
+  const wsUrl = `${protocol}://${PARTYKIT_HOST}/party/swordbrawl`;
+
+  conn = new WebSocket(wsUrl);
+  conn.addEventListener('message', handleServerMessage);
+  conn.addEventListener('open', () => {
+    console.log('Connected to server');
+    document.getElementById('loadStatus').textContent = 'Connected, waiting for init...';
+  });
+  conn.addEventListener('close', () => {
+    console.log('Disconnected, reconnecting...');
+    document.getElementById('overlay').style.display = 'flex';
+    document.getElementById('loadStatus').textContent = 'Reconnecting...';
+    setTimeout(connect, 2000);
+  });
+  conn.addEventListener('error', () => {
+    setTimeout(connect, 2000);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+initThreeJS();
+initInputHandlers();
+connect();
+requestAnimationFrame(mainLoop);
+
+</script>
+</body>
+</html>

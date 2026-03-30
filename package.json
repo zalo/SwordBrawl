@@ -1,0 +1,17 @@
+{
+  "name": "swordbrawl",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "partykit dev --live",
+    "deploy": "partykit deploy"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.21.0",
+    "partysocket": "^1.1.4"
+  },
+  "devDependencies": {
+    "partykit": "^0.0.115",
+    "typescript": "^5.8.3"
+  }
+}
