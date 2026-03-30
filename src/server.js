@@ -1336,9 +1336,18 @@ class PartyServer {
     console.log('Connected:', conn.id);
 
     if (!this.humanoidData) {
-      // Not ready yet, tell client to wait
       conn.send(JSON.stringify({ type: 'waiting', message: 'Server initializing...' }));
       return;
+    }
+
+    // Clean up stale players from connections that no longer exist
+    const activeIds = new Set([...this.room.getConnections()].map(c => c.id));
+    for (const pid in this.players) {
+      if (!activeIds.has(pid)) {
+        console.log('Cleaning stale player:', pid);
+        this.players[pid].destroy(this.pxScene);
+        delete this.players[pid];
+      }
     }
 
     const spawnIndex = this.globalPlayerCount++;
