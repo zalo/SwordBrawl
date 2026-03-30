@@ -72,6 +72,13 @@ canvas { display: block; }
     outline: none; width: 140px; margin-left: 6px;
 }
 #name-panel input:focus { border-color: #7c83ff; }
+#lock-on-btn {
+    position: absolute; top: 12px; right: 220px; z-index: 7;
+    background: rgba(30,30,60,0.85); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px; padding: 8px 14px; color: #b0b0d0; font-size: 13px;
+    cursor: pointer; user-select: none; touch-action: manipulation;
+}
+#lock-on-btn.active { background: rgba(120,40,40,0.85); color: #ff8888; border-color: #ff4444; }
 #player-list {
     position: absolute; top: 60px; right: 16px; z-index: 5;
     color: #b0b0d0; font-size: 12px; line-height: 1.8;
@@ -94,6 +101,8 @@ canvas { display: block; }
     <div id="fpsDisplay">FPS: --</div>
     <div id="playerCount">Players: 0</div>
 </div>
+
+<div id="lock-on-btn" onclick="toggleLockOn()">Lock [Tab]</div>
 
 <div id="name-panel">
     <label>Name: <input id="nameInput" type="text" maxlength="20" placeholder="Enter name..." /></label>
@@ -185,6 +194,10 @@ let tpCamYaw = 0;
 let tpCamPitch = 0.35;
 let camMouseDown = false;
 let camLastX = 0, camLastY = 0;
+
+// Lock-on targeting
+let lockOnEnabled = false;
+let lockOnTargetId = null;
 
 let frameCount = 0, lastFpsTime = 0;
 
@@ -465,6 +478,7 @@ function initInputHandlers() {
     if (e.key === ' ') { actionJump = true; e.preventDefault(); }
     if (e.key.toLowerCase() === 'q') actionKick = true;
     if (e.key.toLowerCase() === 'e') actionBlock = true;
+    if (e.key === 'Tab') { e.preventDefault(); toggleLockOn(); }
   });
   window.addEventListener('keyup', e => {
     keysDown[e.key.toLowerCase()] = false;
@@ -628,12 +642,69 @@ function getSteeringFromInput() {
 }
 
 // ---------------------------------------------------------------------------
+// Lock-on targeting
+// ---------------------------------------------------------------------------
+function toggleLockOn() {
+  lockOnEnabled = !lockOnEnabled;
+  const btn = document.getElementById('lock-on-btn');
+  if (lockOnEnabled) {
+    // Find nearest player at the moment of activation
+    lockOnTargetId = findNearestPlayerId();
+    btn.classList.add('active');
+    btn.textContent = lockOnTargetId ? 'Locked [Tab]' : 'No target [Tab]';
+    if (!lockOnTargetId) { lockOnEnabled = false; btn.classList.remove('active'); }
+  } else {
+    lockOnTargetId = null;
+    btn.classList.remove('active');
+    btn.textContent = 'Lock [Tab]';
+  }
+}
+
+function findNearestPlayerId() {
+  if (!myPlayerId || !playerPoses[myPlayerId]) return null;
+  const my = playerPoses[myPlayerId];
+  const mx = my[0], my2 = my[1];
+  let nearest = null, nearestDist = Infinity;
+  for (const pid in playerPoses) {
+    if (pid === myPlayerId) continue;
+    const p = playerPoses[pid];
+    const dx = p[0] - mx, dy = p[1] - my2;
+    const dist = dx * dx + dy * dy;
+    if (dist < nearestDist) { nearestDist = dist; nearest = pid; }
+  }
+  return nearest;
+}
+
 // Third-person camera
 // ---------------------------------------------------------------------------
 function updateThirdPersonCamera() {
   if (!myPlayerId || !playerPoses[myPlayerId]) return;
   const poses = playerPoses[myPlayerId];
   const px2 = poses[0], py2 = poses[1], pz2 = poses[2];
+
+  // Lock-on: rotate yaw towards target
+  if (lockOnEnabled && lockOnTargetId && playerPoses[lockOnTargetId]) {
+    const tp = playerPoses[lockOnTargetId];
+    // Direction from me to target in PhysX XY plane
+    const dx = tp[0] - px2, dy = tp[1] - py2;
+    // Target yaw: camera looks FROM behind me TOWARD the target
+    // Camera is at yaw angle behind the character, so we want yaw such that
+    // the character faces the target. Camera yaw = direction from char to camera.
+    // Character faces opposite of camera yaw direction.
+    // So targetYaw = atan2(dy, dx) + PI (camera behind the facing direction)
+    const targetYaw = Math.atan2(dy, dx) + Math.PI;
+    // Smoothly interpolate yaw (handle wrap-around)
+    let diff = targetYaw - tpCamYaw;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    tpCamYaw += diff * 0.08;
+    // Clear target if player disconnected
+  } else if (lockOnEnabled && lockOnTargetId && !playerPoses[lockOnTargetId]) {
+    lockOnEnabled = false;
+    lockOnTargetId = null;
+    document.getElementById('lock-on-btn').classList.remove('active');
+    document.getElementById('lock-on-btn').textContent = 'Lock [Tab]';
+  }
 
   // Character position in Three.js Y-up coords (worldGroup rotates -90 X)
   const charX = px2, charY = Math.max(pz2, 0.5), charZ = -py2;
