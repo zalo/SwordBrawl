@@ -239,11 +239,12 @@ function initThreeJS() {
 
   // Ground
   const groundMat = new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.9, metalness: 0.1 });
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), groundMat);
+  const ground = new THREE.Mesh(new THREE.BoxGeometry(20, 20, 1), groundMat);
+  ground.position.set(0, 0, -0.5);
   ground.receiveShadow = true;
   worldGroup.add(ground);
 
-  const grid = new THREE.GridHelper(80, 80, 0x333355, 0x2a2a44);
+  const grid = new THREE.GridHelper(20, 20, 0x333355, 0x2a2a44);
   grid.rotation.x = Math.PI / 2;
   worldGroup.add(grid);
 

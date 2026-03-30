@@ -666,7 +666,7 @@ class PlayerHumanoid {
 
     // Spawn offset: spread players in a line
     // Random spawn within a radius
-    const spawnRadius = 8;
+    const spawnRadius = 5;
     const angle = Math.random() * Math.PI * 2;
     const dist = Math.sqrt(Math.random()) * spawnRadius;
     const spawnX = Math.cos(angle) * dist;
@@ -1146,7 +1146,7 @@ class PartyServer {
     // Ground plane
     const SHAPE_FLAGS_VAL = px.PxShapeFlagEnum.eSCENE_QUERY_SHAPE | px.PxShapeFlagEnum.eSIMULATION_SHAPE;
     const groundShapeFlags = new px.PxShapeFlags(SHAPE_FLAGS_VAL);
-    const groundGeom = new px.PxBoxGeometry(50, 50, 0.5);
+    const groundGeom = new px.PxBoxGeometry(10, 10, 0.5);
     const groundShape = this.physics.createShape(groundGeom, this.material, true, groundShapeFlags);
     groundShape.setSimulationFilterData(new px.PxFilterData(1, 7, 0, 0));
     this.groundActor = this.physics.createRigidStatic(new px.PxTransform(
