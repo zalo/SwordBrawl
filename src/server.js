@@ -1437,6 +1437,19 @@ class PartyServer {
       }
     }
 
+    // Disconnect inactive players (no messages for 60 seconds)
+    const now2 = Date.now();
+    for (const pid of playerIds) {
+      if (pid === this.CPU_PLAYER_ID) continue;
+      const player = this.players[pid];
+      if (player && player.lastActivity && now2 - player.lastActivity > 60000) {
+        console.log('Disconnecting inactive player:', pid);
+        for (const conn of this.room.getConnections()) {
+          if (conn.id === pid) { conn.close(4000, 'Inactive'); break; }
+        }
+      }
+    }
+
     // Broadcast state at STATE_HZ
     this.tickCounter++;
     if (this.tickCounter % Math.round(TICK_HZ / STATE_HZ) === 0) {
@@ -1500,6 +1513,7 @@ class PartyServer {
     const spawnIndex = this.globalPlayerCount++;
     const player = new PlayerHumanoid(conn.id, this.px, this.physics, this.pxScene, this.material, this.humanoidData, spawnIndex);
     player._spawnIndex = spawnIndex;
+    player.lastActivity = Date.now();
     this.players[conn.id] = player;
 
     // Send init data: humanoid geometry for rendering, and the body list
@@ -1521,6 +1535,9 @@ class PartyServer {
     try { data = JSON.parse(/** @type {string} */(message)); } catch(e) { return; }
 
     const player = this.players[sender.id];
+
+    // Any message resets the inactivity timer
+    if (player) player.lastActivity = Date.now();
 
     if (data.type === 'input' && player) {
       if (data.moveDir) player.moveDir = data.moveDir;

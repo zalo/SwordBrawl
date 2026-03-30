@@ -424,7 +424,22 @@ function updateMeshPoses() {
 // ---------------------------------------------------------------------------
 // Input handling
 // ---------------------------------------------------------------------------
+let _lastPingTime = 0;
+function sendPing() {
+  const now = performance.now();
+  if (now - _lastPingTime < 1000) return; // rate limit to 1Hz
+  _lastPingTime = now;
+  if (conn && conn.readyState === WebSocket.OPEN) {
+    conn.send(JSON.stringify({ type: 'ping' }));
+  }
+}
+
 function initInputHandlers() {
+  // Any interaction resets the server-side inactivity timer (rate-limited to 1Hz)
+  window.addEventListener('click', sendPing);
+  window.addEventListener('touchstart', sendPing, { passive: true });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) sendPing(); });
+
   const isTouchDevice = 'ontouchstart' in window;
 
   if (isTouchDevice) {
@@ -765,10 +780,11 @@ function connect() {
     console.log('Connected to server');
     document.getElementById('loadStatus').textContent = 'Connected, waiting for init...';
   });
-  conn.addEventListener('close', () => {
-    console.log('Disconnected, reconnecting...');
+  conn.addEventListener('close', (e) => {
+    console.log('Disconnected, reconnecting...', e.code, e.reason);
     document.getElementById('overlay').style.display = 'flex';
-    document.getElementById('loadStatus').textContent = 'Reconnecting...';
+    document.getElementById('loadStatus').textContent =
+      e.code === 4000 ? 'Disconnected (inactive). Reconnecting...' : 'Reconnecting...';
     setTimeout(connect, 2000);
   });
   conn.addEventListener('error', () => {
